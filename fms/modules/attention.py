@@ -605,18 +605,18 @@ class MultiHeadAttention(nn.Module):
             values = values.transpose(1,2).contiguous()  # b h l d
             rates = static_src
 
-            #attn, affs = self.UA(queries, keys, values, True, 1.3, static_src, static_dest)
+            attn, affs = self.UA(queries, keys, values, True, 1.3, static_src, static_dest)
 
-            r = self.nheads // self.kvheads
-            affs = self._gen_affinity_scores(keys, static_src, static_dest, r)  # b h l_q l_k
-            torch.backends.cuda.enable_math_sdp(False)
-            attn = F.scaled_dot_product_attention(
-                queries, 
-                torch.repeat(keys,r,dim=1), 
-                torch.repeat(values,r,dim=1), 
-                attn_mask=affs,
-                scale=1,
-            )  # b h l d
+            #r = self.nheads // self.kvheads
+            #affs = self._gen_affinity_scores(keys, static_src, static_dest, r)  # b h l_q l_k
+            #torch.backends.cuda.enable_math_sdp(False)
+            #attn = F.scaled_dot_product_attention(
+            #    queries, 
+            #    torch.repeat(keys,r,dim=1), 
+            #    torch.repeat(values,r,dim=1), 
+            #    attn_mask=affs,
+            #    scale=1,
+            #)  # b h l d
             attn = attn.transpose(1,2).contiguous()  # b l h d
             affs = affs[:, :, -1, :].exp()  # b h l
             aux = affs.gt(.001).to(dtype=affs.dtype).view(batch_size, -1).mean(-1).add(static.mean().detach()).sub(static.mean())

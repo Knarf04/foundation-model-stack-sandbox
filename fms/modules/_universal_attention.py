@@ -455,7 +455,7 @@ class _attention(torch.autograd.Function):
         ctx.sm_scale = sm_scale
         ctx.HEAD_DIM = HEAD_DIM_K
         ctx.causal = causal
-        return o[:, :, :, :HEAD_DIM_K], desc_affinity[:, :, -1, :]
+        return o[:, :, :, :HEAD_DIM_K], desc_affinity
 
     @staticmethod
     def backward(ctx, do, dlastaff):
