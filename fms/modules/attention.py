@@ -612,8 +612,8 @@ class MultiHeadAttention(nn.Module):
             #torch.backends.cuda.enable_math_sdp(False)
             #attn = F.scaled_dot_product_attention(
             #    queries, 
-            #    torch.repeat(keys,r,dim=1), 
-            #    torch.repeat(values,r,dim=1), 
+            #    keys.repeat(1, r, 1, 1),
+            #    values.repeat(1, r, 1, 1)
             #    attn_mask=affs,
             #    scale=1,
             #)  # b h l d
@@ -674,7 +674,7 @@ class MultiHeadAttention(nn.Module):
         affinity = affinity.triu(1).cumsum(3).to(dtype=k.dtype)
         affinity = affinity.masked_fill(torch.ones_like(affinity, dtype=torch.bool).tril(-1), -1e12).transpose(-1, -2)
         #return torch.repeat_interleave(affinity,r,dim=1)
-        return torch.repeat(affinity,r,dim=1)
+        return affinity.repeat(1, r, 1, 1)
 
 
 
