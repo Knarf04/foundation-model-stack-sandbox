@@ -613,7 +613,7 @@ class MultiHeadAttention(nn.Module):
             #attn = F.scaled_dot_product_attention(
             #    queries, 
             #    keys.repeat(1, r, 1, 1),
-            #    values.repeat(1, r, 1, 1)
+            #    values.repeat(1, r, 1, 1),
             #    attn_mask=affs,
             #    scale=1,
             #)  # b h l d
