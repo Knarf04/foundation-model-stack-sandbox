@@ -92,7 +92,7 @@ def _aff_fwd_kernel(
         prev_sum += curr_sum
         
         # .masked_fill(mask.tril(-1), -1e12)
-        affinity = tl.where((offs_i[:, None] > offs_j[None, :]), -1e12, affinity)
+        affinity = tl.where((offs_i[:, None] > offs_j[None, :]), -1.0e8, affinity)
 
         tl.store(aff_ptr + offs_i[:, None] * str_aff_li + offs_j[None, :] * str_aff_lj, 
             affinity, mask=(offs_i[:, None] < L) & (offs_j[None, :] < L))
