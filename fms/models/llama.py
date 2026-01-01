@@ -13,6 +13,7 @@ from fms.distributed.strategy import (
     NoOpStrategy,
     TensorParallelStrategy,
 )
+# from fms.modules.universal_attention import (
 from fms.modules.attention import (
     AttentionKwargs,
     MultiHeadAttention,
