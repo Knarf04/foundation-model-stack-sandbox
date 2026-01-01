@@ -5,12 +5,24 @@ from typing import (
     Callable,
     List,
     Mapping,
-    NotRequired,
+    # NotRequired,
     Optional,
     Tuple,
-    TypedDict,
-    Unpack,
+    # TypedDict,
+    # Unpack,
 )
+try:
+    from typing import (
+        NotRequired,
+        TypedDict,
+        Unpack,
+    )
+except ImportError:
+    from typing_extensions import (
+        NotRequired,
+        TypedDict,
+        Unpack,
+    )
 
 import torch
 import torch.distributed
