@@ -586,6 +586,7 @@ class MultiHeadAttention(nn.Module):
             decay = kk.relu().float().pow(2)
             decay = (decay * r * static_dest.unsqueeze(-1)).pow(1/3)
             decay = torch.log1p(decay.clamp(min=0, max=1-1e-6).neg())
+            print(a.shape, decay.shape)
             a = a + decay
 
             # Update r/a cache
