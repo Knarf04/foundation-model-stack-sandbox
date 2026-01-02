@@ -78,12 +78,6 @@ class UniversalAttention(Function):
         ctx.save_for_backward(kc,vc,xq,ss,sd)
 
     @staticmethod
-    def setup_context(ctx, inputs, outputs):
-        kc,vc,xq,ss,sd = inputs
-        # out,denom = outputs
-        ctx.save_for_backward(kc,vc,xq,ss,sd)
-
-    @staticmethod
     def backward(ctx, g_out, g_denom, g_affs):
         # Note: when using mixed precision, g_out is downcast but g_denom is always fp32
         kc,vc,xq,static_src,static_dest = ctx.saved_tensors
@@ -614,13 +608,15 @@ class MultiHeadAttention(nn.Module):
                 scale=1,
             )  # b h l d
             attn = attn.transpose(1,2).contiguous()  # b l h d
-            affs = mask.view(batch_size, self.kvheads, -1, mask.size(-2), mask.size(-1))[:,:,0]  # b h l l
-            affsm = affs.exp().mean()
-            affs = affs[:, :, -1, :] # only cache the last query row
-            with torch.no_grad():
-                aux = affs.gt(.001).to(dtype=affs.dtype).mean()  # *l*l / (l*(l+1)/2)  =  *2l/(l+1)
-                aux = aux * (2 * q_len / (q_len+1))
-            aux = aux.sub(affsm.detach()).add(affsm)
+            affs = mask.view(batch_size, self.kvheads, -1, mask.size(-2), mask.size(-1))[:,:,0,-1,:]  # b h l
+            
+            # Remove aux computation for inference
+            # exp_mask = mask.exp()
+            # affsm = exp_mask.mean()
+            # with torch.no_grad():
+            #     aux = exp_mask.gt(.001).to(dtype=affs.dtype).mean()  # *l*l / (l*(l+1)/2)  =  *2l/(l+1)
+            #     aux = aux * (2 * q_len / (q_len+1))
+            # aux = aux.sub(affsm.detach()).add(affsm)
 
             # c = 512
             # b = batch_size
@@ -666,7 +662,7 @@ class MultiHeadAttention(nn.Module):
         if use_cache:
             return out, (keys, values, rates, affs)
         else:
-            return out, aux
+            return out, None#, aux
 
     @torch.compile
     def _gen_affinity_scores(self, k, src, dest, r):
