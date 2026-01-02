@@ -586,7 +586,6 @@ class MultiHeadAttention(nn.Module):
             decay = kk.relu().float().pow(2)
             decay = (decay * r * static_dest.unsqueeze(-1)).pow(1/3)
             decay = torch.log1p(decay.clamp(min=0, max=1-1e-6).neg())
-            print(a.shape, decay.shape)
             a = a + decay
 
             # Update r/a cache
@@ -617,6 +616,7 @@ class MultiHeadAttention(nn.Module):
             attn = attn.transpose(1,2).contiguous()  # b l h d
             affs = mask.view(batch_size, self.kvheads, -1, mask.size(-2), mask.size(-1))[:,:,0].exp()  # b h l l
             affsm = affs.mean()
+            affs = affs[:, :, -1, :] # only cache the last query row
             with torch.no_grad():
                 aux = affs.gt(.001).to(dtype=affs.dtype).mean()  # *l*l / (l*(l+1)/2)  =  *2l/(l+1)
                 aux = aux * (2 * q_len / (q_len+1))
