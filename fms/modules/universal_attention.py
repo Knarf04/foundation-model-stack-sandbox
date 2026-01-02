@@ -608,15 +608,15 @@ class MultiHeadAttention(nn.Module):
                 scale=1,
             )  # b h l d
             attn = attn.transpose(1,2).contiguous()  # b l h d
-            affs = mask.view(batch_size, self.kvheads, -1, mask.size(-2), mask.size(-1))[:,:,0,-1,:]  # b h l
-            
-            # Remove aux computation for inference
-            # exp_mask = mask.exp()
-            # affsm = exp_mask.mean()
-            # with torch.no_grad():
-            #     aux = exp_mask.gt(.001).to(dtype=affs.dtype).mean()  # *l*l / (l*(l+1)/2)  =  *2l/(l+1)
-            #     aux = aux * (2 * q_len / (q_len+1))
-            # aux = aux.sub(affsm.detach()).add(affsm)
+            affs_log = mask.view(batch_size, self.kvheads, -1, mask.size(-2), mask.size(-1))[:,:,0]  # b h l
+            affs = affs_log[:,:,-1,:]  # b h l
+
+            exp_mask = affs_log.exp()
+            affsm = exp_mask.mean()
+            with torch.no_grad():
+                aux = exp_mask.gt(.001).to(dtype=affs.dtype).mean()  # *l*l / (l*(l+1)/2)  =  *2l/(l+1)
+                aux = aux * (2 * q_len / (q_len+1))
+            aux = aux.sub(affsm.detach()).add(affsm)
 
             # c = 512
             # b = batch_size
@@ -662,7 +662,7 @@ class MultiHeadAttention(nn.Module):
         if use_cache:
             return out, (keys, values, rates, affs)
         else:
-            return out, None#, aux
+            return out, aux
 
     @torch.compile
     def _gen_affinity_scores(self, k, src, dest, r):
