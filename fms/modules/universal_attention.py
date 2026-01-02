@@ -1,7 +1,6 @@
 import abc
 import functools
 import math
-import os
 from typing import (
     Any,
     Callable,
@@ -139,21 +138,6 @@ class UniversalAttention(Function):
 
         return dkc,dvc,dxq,dstat_src,dstat_dest
 
-class PassThresh(Function):
-    @staticmethod
-    def forward(mask):
-        return mask[:,:,-1].gt(.001).view(mask.size(0),-1).sum(-1).to(dtype=mask.dtype).div(mask.size(1)*mask.size(3))
-    @staticmethod
-    def setup_context(ctx, inputs, output):
-        mask = inputs[0]
-        ctx.l = mask.size(1)
-        ctx.dim0 = mask.size(2)
-        ctx.dim1 = mask.size(3)
-    @staticmethod
-    def backward(ctx, g):
-        g = g / (ctx.l * ctx.dim0 * ctx.dim1)
-        return g[:,None,None,None].expand(g.size(0), ctx.l, ctx.dim0, ctx.dim1)
-pass_thresh = PassThresh.apply
 
 class SMVecMatMul(Function):
     @staticmethod
@@ -501,7 +485,6 @@ class MultiHeadAttention(nn.Module):
         self.wstatic = nn.Linear(self.emb_dim, self.kvheads*2, bias=True)
         self.register_buffer("staticb", torch.empty(self.kvheads*2, dtype=self.wstatic.bias.dtype))
 
-        # Use a argument to 
         self.UA = UniversalAttention.apply
         self.SMVMM = SMVecMatMul.apply
 
@@ -621,26 +604,22 @@ class MultiHeadAttention(nn.Module):
             rates = static_src
 
             r = self.nheads // self.kvheads
-            mask, mask_slim = self._gen_affinity_scores(keys, static_src, static_dest, r)  # b h l_q l_k
-
-            aux = self._calc_aux(mask_slim)
-
-            # affs = mask.view(batch_size, self.kvheads, -1, mask.size(-2), mask.size(-1))[:,:,0].exp()  # b h l l
-            # affsm = affs.mean()
-            # with torch.no_grad():
-            #     aux = affs.gt(.001).to(dtype=affs.dtype).mean()  # *l*l / (l*(l+1)/2)  =  *2l/(l+1)
-            #     aux = aux * (2 * q_len / (q_len+1))
-            # aux = aux.sub(affsm.detach()).add(affsm)
-
+            mask = self._gen_affinity_scores(keys, static_src, static_dest, r)  # b h l_q l_k
             torch.backends.cuda.enable_math_sdp(False)
             attn = F.scaled_dot_product_attention(
                 queries, 
-                keys.repeat(1,r,1,1),
-                values.repeat(1,r,1,1),
-                attn_mask=mask,  # torch.repeat_interleave(mask,r,dim=1),
+                torch.repeat_interleave(keys,r,dim=1), 
+                torch.repeat_interleave(values,r,dim=1), 
+                attn_mask=mask,
                 scale=1,
             )  # b h l d
             attn = attn.transpose(1,2).contiguous()  # b l h d
+            affs = mask.view(batch_size, self.kvheads, -1, mask.size(-2), mask.size(-1))[:,:,0].exp()  # b h l l
+            affsm = affs.mean()
+            with torch.no_grad():
+                aux = affs.gt(.001).to(dtype=affs.dtype).mean()  # *l*l / (l*(l+1)/2)  =  *2l/(l+1)
+                aux = aux * (2 * q_len / (q_len+1))
+            aux = aux.sub(affsm.detach()).add(affsm)
 
             # c = 512
             # b = batch_size
@@ -690,19 +669,11 @@ class MultiHeadAttention(nn.Module):
 
     @torch.compile
     def _gen_affinity_scores(self, k, src, dest, r):
-        affinity = torch.einsum('bnqh, bnkh -> bnqk', k*dest.sqrt().unsqueeze(-1), k*src.sqrt().unsqueeze(-1)).relu().float().pow(2/3)
+        affinity = torch.einsum('bnqh, bnkh -> bnqk', k*src.sqrt().unsqueeze(-1), k*dest.sqrt().unsqueeze(-1)).relu().float().pow(2/3)
         affinity = torch.log1p(affinity.clamp(min=0, max=1-1e-6).neg())
-        affinity = affinity.tril(-1).cumsum(2).to(dtype=k.dtype)
-        mask = affinity.exp()
-        affinity = affinity.masked_fill(torch.ones_like(affinity, dtype=torch.bool).triu(1), float('-inf'))
-        return affinity.repeat(1,r,1,1), mask
-
-    @torch.compile
-    def _calc_aux(self, mask):
-        aux = pass_thresh(mask)
-        return aux
-        
-
+        affinity = affinity.triu(1).cumsum(3).to(dtype=k.dtype)
+        affinity = affinity.masked_fill(torch.ones_like(affinity, dtype=torch.bool).tril(-1), -1e12).transpose(-1, -2)
+        return torch.repeat_interleave(affinity,r,dim=1)
 
 
 
