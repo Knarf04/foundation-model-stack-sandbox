@@ -614,8 +614,8 @@ class MultiHeadAttention(nn.Module):
                 scale=1,
             )  # b h l d
             attn = attn.transpose(1,2).contiguous()  # b l h d
-            affs = mask.view(batch_size, self.kvheads, -1, mask.size(-2), mask.size(-1))[:,:,0].exp()  # b h l l
-            affsm = affs.mean()
+            affs = mask.view(batch_size, self.kvheads, -1, mask.size(-2), mask.size(-1))[:,:,0]  # b h l l
+            affsm = affs.exp().mean()
             affs = affs[:, :, -1, :] # only cache the last query row
             with torch.no_grad():
                 aux = affs.gt(.001).to(dtype=affs.dtype).mean()  # *l*l / (l*(l+1)/2)  =  *2l/(l+1)
