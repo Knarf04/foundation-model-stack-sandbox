@@ -592,69 +592,47 @@ class MultiHeadAttention(nn.Module):
             
         else:
             # Blockwise universal attention
-            queries = queries.transpose(1,2)   # b hr l d
+            queries = queries.transpose(1,2).view(batch_size, self.kvheads, -1, q_len, self.emb_kq_per_head)  # b h r l d
             keys = keys.transpose(1,2)  # b h l d
             values = values.transpose(1,2)  # b h l d
             rates = static_src
 
-            r = self.nheads // self.kvheads
-            mask = self._gen_affinity_scores(keys, static_src, static_dest, r)  # b h l_q l_k
-            torch.backends.cuda.enable_math_sdp(False)
-            attn = F.scaled_dot_product_attention(
-                queries, 
-                torch.repeat_interleave(keys,r,dim=1), 
-                torch.repeat_interleave(values,r,dim=1), 
-                attn_mask=mask,
-                scale=1,
-            )  # b h l d
-            attn = attn.transpose(1,2).contiguous()  # b l h d
+            c = 1024
+            b = batch_size
+            # Right-pad k,v,src if len not divisible by chunksize
+            if q_len % c != 0:
+                slack = c - q_len % c
+                queries = torch.cat([queries, torch.zeros(b, self.kvheads, self.nheads//self.kvheads, slack, self.emb_kq_per_head, 
+                                                          device=queries.device, dtype=queries.dtype)], dim=-2)
+                keys = torch.cat([keys, torch.zeros(b, self.kvheads, slack, self.emb_kq_per_head, 
+                                                          device=keys.device, dtype=keys.dtype)], dim=-2)
+                values = torch.cat([values, torch.zeros(b, self.kvheads, slack, self.emb_v_per_head, 
+                                                          device=values.device, dtype=values.dtype)], dim=-2)
+                static_src = torch.cat([static_src, torch.zeros(b, self.kvheads, slack,
+                                                               device=static_src.device, dtype=static_src.dtype)], dim=-1)
+                static_dest = torch.cat([static_dest, torch.zeros(b, self.kvheads, slack,
+                                                               device=static_dest.device, dtype=static_dest.dtype)], dim=-1)
 
-            r = self.nheads // self.kvheads
-            affs = mask[:, ::r, -1, :].contiguous() # b h l
+            # Chunk inputs
+            l = static_src.size(2)
+            n = l//c
+            s = [b, self.kvheads, n, c, -1]
+            kc = keys.view(*s)  # b h n c d
+            vc = values.view(*s)
+            static_src = static_src.view(b, self.kvheads, n, c)  # b h n c
 
-            mask_exp = mask[:, ::r].exp()
-            affsm = mask_exp.mean()
-            with torch.no_grad():
-                aux = mask_exp.gt(.001).to(dtype=affs.dtype).mean()  # *l*l / (l*(l+1)/2)  =  *2l/(l+1)
-                aux = aux * (2 * q_len / (q_len+1))
-            aux = aux.sub(affsm.detach()).add(affsm)
+            # Perform UA
+            output, denom, affs = self.UA(kc, vc, queries, static_src, static_dest)
 
-            # c = 512
-            # b = batch_size
-            # # Right-pad k,v,src if len not divisible by chunksize
-            # if q_len % c != 0:
-            #     slack = c - q_len % c
-            #     queries = torch.cat([queries, torch.zeros(b, self.kvheads, self.nheads//self.kvheads, slack, self.emb_kq_per_head, 
-            #                                               device=queries.device, dtype=queries.dtype)], dim=-2)
-            #     keys = torch.cat([keys, torch.zeros(b, self.kvheads, slack, self.emb_kq_per_head, 
-            #                                               device=keys.device, dtype=keys.dtype)], dim=-2)
-            #     values = torch.cat([values, torch.zeros(b, self.kvheads, slack, self.emb_v_per_head, 
-            #                                               device=values.device, dtype=values.dtype)], dim=-2)
-            #     static_src = torch.cat([static_src, torch.zeros(b, self.kvheads, slack,
-            #                                                    device=static_src.device, dtype=static_src.dtype)], dim=-1)
-            #     static_dest = torch.cat([static_dest, torch.zeros(b, self.kvheads, slack,
-            #                                                    device=static_dest.device, dtype=static_dest.dtype)], dim=-1)
+            # Weighted avg for final softmax
+            output = self.SMVMM(output, denom)  # b h r l d
+            attn = output.permute(0,3,1,2,4).reshape(b,l,-1)
 
-            # # Chunk inputs
-            # l = static_src.size(2)
-            # n = l//c
-            # s = [b, self.kvheads, n, c, -1]
-            # kc = keys.view(*s)  # b h n c d
-            # vc = values.view(*s)
-            # static_src = static_src.view(b, self.kvheads, n, c)  # b h n c
-
-            # # Perform UA
-            # output, denom, affs = self.UA(kc, vc, queries, static_src, static_dest)
-
-            # # Weighted avg for final softmax
-            # output = self.SMVMM(output, denom)  # b h r l d
-            # attn = output.permute(0,3,1,2,4).reshape(b,l,-1)
-
-            # # Prune any right-padding
-            # keys = keys[:,:,:q_len]
-            # values = values[:,:,:q_len]
-            # affs = affs[:,:,:q_len]
-            # attn = attn[:,:q_len]
+            # Prune any right-padding
+            keys = keys[:,:,:q_len]
+            values = values[:,:,:q_len]
+            affs = affs[:,:,:q_len]
+            attn = attn[:,:q_len]
 
         attn = attn.view(batch_size, q_len, self.nheads * self.emb_v_per_head)
         out = self.dense(attn)
@@ -663,17 +641,8 @@ class MultiHeadAttention(nn.Module):
         if use_cache:
             return out, (keys, values, rates, affs)
         else:
-            return out, aux
-
-    @torch.compile
-    def _gen_affinity_scores(self, k, src, dest, r):
-        affinity = torch.einsum('bnqh, bnkh -> bnqk', k*src.sqrt().unsqueeze(-1), k*dest.sqrt().unsqueeze(-1)).relu().float().pow(2/3)
-        affinity = torch.log1p(affinity.clamp(min=0, max=1-1e-6).neg())
-        affinity = affinity.triu(1).cumsum(3).to(dtype=k.dtype)
-        affinity = affinity.masked_fill(torch.ones_like(affinity, dtype=torch.bool).tril(-1), -1e12).transpose(-1, -2)
-        return torch.repeat_interleave(affinity,r,dim=1)
-
-
+            return out
+        
 
 class TPMultiHeadAttention(MultiHeadAttention, TPModule):
     """
