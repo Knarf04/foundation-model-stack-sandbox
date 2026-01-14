@@ -563,7 +563,10 @@ class MultiHeadAttention(nn.Module):
             (k, v, r, a) = past_key_value_state  # bhld, bhld, bhl, bhl
             k_ = keys.squeeze(1)  # b h d
             v_ = values.squeeze(1)  # b h d
-            q = queries.view(batch_size, self.kvheads, -1, self.emb_kq_per_head)  # b h r d
+            # repeat_interleave
+            # q = queries.view(batch_size, self.kvheads, -1, self.emb_kq_per_head)  # b h r d
+            # repeat(1, r, 1, 1)
+            q = queries.view(batch_size, -1, self.kvheads, self.emb_kq_per_head).transpose(1, 2)  # b h r d
             static_src = static_src.squeeze(2)  # b h
             static_dest = static_dest.squeeze(2)  # b h
 
@@ -588,11 +591,16 @@ class MultiHeadAttention(nn.Module):
 
             # Perform scaled attention
             attn = qk.float().add(a.unsqueeze(-1)).softmax(dim=2).to(dtype=v.dtype).transpose(-1,-2).matmul(v)  # b h r d
+            attn = attn.transpose(1,2).contiguous()  # b r h d -> reorder for correct head sequence with repeat() style
             (keys, values, rates, affs) = k,v,r,a
             
         else:
             # Blockwise universal attention
-            queries = queries.transpose(1,2).view(batch_size, self.kvheads, -1, q_len, self.emb_kq_per_head)  # b h r l d
+            # repeat_interleave 
+            # queries = queries.transpose(1,2).view(batch_size, self.kvheads, -1, q_len, self.emb_kq_per_head) 
+            # repeat(1, r, 1, 1)
+            queries = queries.transpose(1,2).view(batch_size, -1, self.kvheads, q_len, self.emb_kq_per_head).transpose(1, 2)
+
             keys = keys.transpose(1,2)  # b h l d
             values = values.transpose(1,2)  # b h l d
             rates = static_src
@@ -626,7 +634,10 @@ class MultiHeadAttention(nn.Module):
 
             # Weighted avg for final softmax
             output = self.SMVMM(output, denom)  # b h r l d
-            attn = output.permute(0,3,1,2,4).reshape(b,l,-1)
+            # repeat_interleave 
+            # attn = output.permute(0,3,1,2,4).reshape(b,l,-1)
+            # repeat(1, r, 1, 1)
+            attn = output.permute(0,3,2,1,4).reshape(b,l,-1)
 
             # Prune any right-padding
             keys = keys[:,:,:q_len]
