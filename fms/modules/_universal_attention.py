@@ -52,6 +52,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         ), other=0.0).to(tl.float32)
         k = tl.trans(tl.load(desc_k + k_ptr, mask=(tl.arange(0, BLOCK_N)+start_n)[:,None] < N_CTX, other=0.0))
         qk = tl.dot(q, k)
+        qk *= qk_scale
         qk += aff
         ## Let's see if this custom masking fixes the issue. ##
         mask = (offs_m[:, None] >= (start_n + offs_n[None, :])) & ((start_n + offs_n[None, :]) < N_CTX) & (offs_m[:, None] < N_CTX)
@@ -106,8 +107,15 @@ def _attn_fwd(sm_scale, M,  #
     offsetqo_y = off_z * (N_CTX * H * HEAD_DIM) + off_h * N_CTX * HEAD_DIM
     qo_offset_y = offsetqo_y + start_m * BLOCK_M * HEAD_DIM
     ## Compute offset_y of k/v taking into account GQA. ##
-    offset_y = off_z * (N_CTX * KV_H * HEAD_DIM) + (off_h % KV_H) * N_CTX * HEAD_DIM
-    offsetaffinity_y = off_z * (KV_H * N_CTX * N_CTX) + (off_h % KV_H) * (N_CTX * N_CTX) + start_m * BLOCK_M * N_CTX
+    # offset_y = off_z * (N_CTX * KV_H * HEAD_DIM) + (off_h % KV_H) * N_CTX * HEAD_DIM
+    # offsetaffinity_y = off_z * (KV_H * N_CTX * N_CTX) + (off_h % KV_H) * (N_CTX * N_CTX) + start_m * BLOCK_M * N_CTX
+
+    GROUP_SIZE: tl.constexpr = Q_H // KV_H
+    kv_head_idx = off_h // GROUP_SIZE 
+    
+    offset_y = off_z * (N_CTX * KV_H * HEAD_DIM) + kv_head_idx * N_CTX * HEAD_DIM
+    offsetaffinity_y = off_z * (KV_H * N_CTX * N_CTX) + kv_head_idx * (N_CTX * N_CTX) + start_m * BLOCK_M * N_CTX
+
     # initialize offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
@@ -117,7 +125,7 @@ def _attn_fwd(sm_scale, M,  #
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
     # load scales
     qk_scale = sm_scale
-    qk_scale *= 1.44269504  # 1/log(2)
+    # qk_scale *= 1.44269504  # 1/log(2)
     # load q: it will stay in SRAM throughout
     qo_ptr = qo_offset_y + tl.arange(0, BLOCK_M)[:, None] * HEAD_DIM  + tl.arange(0, HEAD_DIM)[None, :]
     q = tl.load(desc_q + qo_ptr, mask=tl.arange(0, BLOCK_M)[:, None] + start_m * BLOCK_M < N_CTX, other=0.0)
@@ -179,8 +187,8 @@ def _attn_bwd_dkdv(dk, dv,  #
         offs_m = start_m + tl.arange(0, BLOCK_M1)
         offs_n = start_n + tl.arange(0, BLOCK_N1)
         offs_k = tl.arange(0, HEAD_DIM)
-        qT_ptrs = Q + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d + q_grp_head * KV_H * N_CTX * HEAD_DIM
-        do_ptrs = DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d + q_grp_head * KV_H * N_CTX * HEAD_DIM
+        qT_ptrs = Q + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d + q_grp_head * N_CTX * HEAD_DIM
+        do_ptrs = DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d + q_grp_head * N_CTX * HEAD_DIM
         # BLOCK_N1 must be a multiple of BLOCK_M1, otherwise the code wouldn't work.
         tl.static_assert(BLOCK_N1 % BLOCK_M1 == 0)
         curr_m = start_m
@@ -288,7 +296,13 @@ def _attn_bwd(Q, K, V, AFFINITY, sm_scale,  #
 
     bhid = tl.program_id(2)
     off_chz = (bhid * N_CTX).to(tl.int64)
-    adj_KV = (stride_h * (bhid % KV_H) + (HEAD_DIM * N_CTX * KV_H) * (bhid // (Q_H * KV_H))).to(tl.int64) ## Is this correct? Seems like there may be an indexing issue here.
+    # adj_KV = (stride_h * (bhid % KV_H) + (HEAD_DIM * N_CTX * KV_H) * (bhid // (Q_H * KV_H))).to(tl.int64) ## Is this correct? Seems like there may be an indexing issue here.
+    total_q_heads = Q_H * KV_H
+    batch_idx = bhid // total_q_heads
+    global_q_head_idx = bhid % total_q_heads
+    kv_head_idx = global_q_head_idx // Q_H 
+    
+    adj_KV = (stride_h * kv_head_idx + (HEAD_DIM * N_CTX * KV_H) * batch_idx).to(tl.int64)
     adj_Q = (stride_h * (bhid % (Q_H * KV_H)) + stride_z * (bhid // (Q_H * KV_H))).to(tl.int64)
     pid = tl.program_id(0)
 
@@ -298,7 +312,8 @@ def _attn_bwd(Q, K, V, AFFINITY, sm_scale,  #
     DQ += adj_Q
     DK += adj_KV
     DV += adj_KV
-    AFFINITY += ((bhid // (KV_H * Q_H)) * (KV_H * N_CTX * N_CTX) + (bhid % (KV_H)) * (N_CTX * N_CTX)).to(tl.int64)
+    # AFFINITY += ((bhid // (KV_H * Q_H)) * (KV_H * N_CTX * N_CTX) + (bhid % (KV_H)) * (N_CTX * N_CTX)).to(tl.int64)
+    AFFINITY += (batch_idx * (KV_H * N_CTX * N_CTX) + kv_head_idx * (N_CTX * N_CTX)).to(tl.int64)
     DAFFINITY += ((bhid // (KV_H * Q_H)) * ((Q_H * KV_H) * N_CTX * N_CTX) + (bhid % (KV_H * Q_H)) * (N_CTX * N_CTX)).to(tl.int64)
     ## Adjust these to batch dimension only since we need to loop through the "r" dimension for GQA. ##
     Q += ((bhid // (Q_H * KV_H)) * stride_z).to(tl.int64)
@@ -315,8 +330,9 @@ def _attn_bwd(Q, K, V, AFFINITY, sm_scale,  #
     offs_n = start_n + tl.arange(0, BLOCK_N1)
 
     ## We predicate this part to run only for a select few blocks. Since in GQA Key/value head cnt is < Query head cnt.
-    b_group = bhid // (Q_H * KV_H)
-    if b_group * (Q_H * KV_H) <= bhid and bhid < b_group * (Q_H * KV_H) + KV_H:
+    # b_group = bhid // (Q_H * KV_H)
+    # if b_group * (Q_H * KV_H) <= bhid and bhid < b_group * (Q_H * KV_H) + KV_H:
+    if (global_q_head_idx % Q_H) == 0:
         dv = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
         dk = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
 
@@ -327,9 +343,13 @@ def _attn_bwd(Q, K, V, AFFINITY, sm_scale,  #
         k = tl.load(K + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d, mask=offs_n[:, None] < N_CTX)
         v = tl.load(V + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d, mask=offs_n[:, None] < N_CTX)
 
+        q_start_ptr = Q + (stride_h * global_q_head_idx).to(tl.int64)
+        do_start_ptr = DO + (stride_h * global_q_head_idx).to(tl.int64)
+
         dk, dv = _attn_bwd_dkdv(dk, dv,  #
-                            Q + (stride_h * (bhid % KV_H)).to(tl.int64), k, v, AFFINITY, sm_scale,  # Correctly point the necessary KV_H channel.
-                            DO + (stride_h * (bhid % KV_H)).to(tl.int64),  # Correctly point to the necessary KV_H channel.
+                            q_start_ptr, # Q + (stride_h * (bhid % KV_H)).to(tl.int64), 
+                            k, v, AFFINITY, sm_scale,  # Correctly point the necessary KV_H channel.
+                            do_start_ptr, # DO + (stride_h * (bhid % KV_H)).to(tl.int64),  # Correctly point to the necessary KV_H channel.
                             M, D,  #
                             stride_tok, stride_d,  #
                             Q_H, KV_H, N_CTX,  #
@@ -358,7 +378,7 @@ def _attn_bwd(Q, K, V, AFFINITY, sm_scale,  #
         tl.store(dv_ptrs, dv.to(dv_ptrs.dtype.element_ty), mask=offs_n[:, None] < N_CTX)
 
         # Write back dK.
-        #dk *= sm_scale
+        dk *= sm_scale
         dk_ptrs = DK + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
         tl.store(dk_ptrs, dk.to(dk_ptrs.dtype.element_ty), mask=offs_n[:, None] < N_CTX)
 
@@ -385,7 +405,7 @@ def _attn_bwd(Q, K, V, AFFINITY, sm_scale,  #
 
     # Write back dQ.
     dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
-    #dq *= sm_scale
+    dq *= sm_scale
     tl.store(dq_ptrs, dq.to(dq_ptrs.dtype.element_ty), mask=offs_m[:, None] < N_CTX)
 
 class _attention(torch.autograd.Function):
@@ -424,7 +444,7 @@ class _attention(torch.autograd.Function):
         desc_o = o
 
         ## Here, we launch an affinity matrix calculation kernel to simplify implementation. ##
-        desc_affinity = _affinity_fwd(k, static_src, static_dest)
+        desc_affinity = _affinity_fwd(k, static_src, static_dest).contiguous()
         #desc_affinity = _gen_affinity_scores(k, static_src, static_dest)
 
         ## Specialize to this blk size for reasonable performance. ##
