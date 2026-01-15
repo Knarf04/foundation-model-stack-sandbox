@@ -623,7 +623,8 @@ class MultiHeadAttention(nn.Module):
             #)  # b h l d
 
             ## Option 2: Optimized multi-kernel implementation. ##
-            attn, affs = self.UA(queries, keys, values, True, 1.3, static_src, static_dest)
+            # Ground truth UniversalAttention doesn't use any scale (effectively scale=1.0)
+            attn, affs = self.UA(queries, keys, values, True, 1.0, static_src, static_dest)
 
             ## Baseline. ##
             #r = self.nheads // self.kvheads

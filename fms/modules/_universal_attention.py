@@ -15,13 +15,14 @@ def supports_host_descriptor():
 
 @torch.compile
 def _gen_affinity_scores(k, src, dest):
+    # Match ground truth: relu().pow(2/3) without adding epsilon before power
     kkt = torch.einsum('bnqh, bnkh -> bnqk', k, k).relu().pow(2/3).float()
+    # Apply src/dest scaling (pre-compute pow(1/3) to match ground truth)
     affinity = kkt * src.pow(1/3).unsqueeze(-1) * dest.pow(1/3).unsqueeze(-2)
     affinity = torch.log1p(affinity.clamp(min=0, max=1-1e-6).neg())
     affinity = affinity.triu(1).cumsum(3)
-    #return torch.transpose(affinity, -1, -2).contiguous().to(k.dtype)
-    ## Seems like this is the closest to the baseline loss wise. ##
-    return torch.transpose(affinity.masked_fill(torch.ones_like(affinity, dtype=torch.bool).tril(-1), -1.0e8), -1, -2).contiguous().to(k.dtype)
+    # Use -1e12 to match ground truth masking value
+    return torch.transpose(affinity.masked_fill(torch.ones_like(affinity, dtype=torch.bool).tril(-1), -1e12), -1, -2).contiguous().to(k.dtype)
 
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q,  #
@@ -54,9 +55,9 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         qk = tl.dot(q, k)
         qk *= qk_scale
         qk += aff
-        ## Let's see if this custom masking fixes the issue. ##
+        # Causal masking: query position must be >= key position
         mask = (offs_m[:, None] >= (start_n + offs_n[None, :])) & ((start_n + offs_n[None, :]) < N_CTX) & (offs_m[:, None] < N_CTX)
-        qk = qk + tl.where(mask, 0, -1.0e8)
+        qk = qk + tl.where(mask, 0, -1e12)
         if STAGE == 2:
             m_ij = tl.maximum(m_i, tl.max(qk, 1))
             qk -= m_ij[:, None]
@@ -149,6 +150,7 @@ def _attn_fwd(sm_scale, M,  #
     m_i += tl.math.log(l_i)
     acc = acc / l_i[:, None]
     m_ptrs = M + off_hz * N_CTX + offs_m
+    m_i = tl.where(m_i == float("-inf"), 0.0, m_i)
     tl.store(m_ptrs, m_i)
     tl.store(desc_o+qo_ptr, acc.to(desc_o.dtype.element_ty), mask=tl.arange(0, BLOCK_M)[:, None]+start_m*BLOCK_M < N_CTX)
 
@@ -183,7 +185,7 @@ def _attn_bwd_dkdv(dk, dv,  #
                    # Filled in by the wrapper.
                    start_n, start_m, num_steps, MASK):
     ## Loop over "r"-dimension.
-    for q_grp_head in range(Q_H):
+    for q_grp_head in tl.range(0, Q_H, 1):
         offs_m = start_m + tl.arange(0, BLOCK_M1)
         offs_n = start_n + tl.arange(0, BLOCK_N1)
         offs_k = tl.arange(0, HEAD_DIM)
@@ -193,15 +195,18 @@ def _attn_bwd_dkdv(dk, dv,  #
         tl.static_assert(BLOCK_N1 % BLOCK_M1 == 0)
         curr_m = start_m
         step_m = BLOCK_M1
-        for blk_idx in range(num_steps):
+        for blk_idx in tl.range(0, num_steps, 1):
             offs_m = curr_m + tl.arange(0, BLOCK_M1)
             qT = tl.trans(tl.load(qT_ptrs, mask=offs_m[:, None] < N_CTX)) ## (HEAD, BLOCK_M1)
             # Load m before computing qk to reduce pipeline stall.
-            m = tl.load(M + offs_m + (q_grp_head * KV_H * N_CTX), mask=offs_m < N_CTX) ## (BLOCK_M1, )
+            # m = tl.load(M + offs_m + (q_grp_head * KV_H * N_CTX), mask=offs_m < N_CTX) ## (BLOCK_M1, )
+            m = tl.load(M + offs_m + (q_grp_head * N_CTX), mask=offs_m < N_CTX) ## (BLOCK_M1, )
             affs = tl.trans(
                 tl.load(AFFINITY + offs_m[:, None] * N_CTX + offs_n[None, :],
                         mask=(offs_m[:, None] < N_CTX) & (offs_n[None, :] < N_CTX))).to(tl.float32) ## (BLOCK_N1, BLOCK_M1)
-            qkT = tl.dot(k, qT) + affs ## (BLOCK_N1, BLOCK_M1)
+            qkT = tl.dot(k, qT)
+            qkT = qkT * sm_scale  # Apply same scaling as forward pass
+            qkT = qkT + affs ## (BLOCK_N1, BLOCK_M1)
             pT = tl.math.exp(qkT - m[None, :])
             # Autoregressive masking.
             if MASK:
@@ -212,7 +217,8 @@ def _attn_bwd_dkdv(dk, dv,  #
             ppT = pT
             dv += tl.dot(ppT, tl.cast(do, tl.float32))
             # D (= delta) is pre-divided by ds_scale.
-            Di = tl.load(D + offs_m + (q_grp_head * KV_H * N_CTX), mask=offs_m < N_CTX)
+            # Di = tl.load(D + offs_m + (q_grp_head * KV_H * N_CTX), mask=offs_m < N_CTX)
+            Di = tl.load(D + offs_m + (q_grp_head * N_CTX), mask=offs_m < N_CTX)
             # Compute dP and dS.
             dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
             dsT = pT * (dpT - Di[None, :])
@@ -231,6 +237,7 @@ def _attn_bwd_dq(dq, q, K, V, AFFINITY,  #
                  do, DAFFINITY, m, D,
                  # shared by Q/K/V/DO.
                  stride_tok, stride_d,  #
+                 sm_scale,  # Scale factor for QK product (must match forward pass)
                  H, N_CTX,  #
                  BLOCK_M2: tl.constexpr,  #
                  BLOCK_N2: tl.constexpr,  #
@@ -239,43 +246,47 @@ def _attn_bwd_dq(dq, q, K, V, AFFINITY,  #
                  start_m, start_n, num_steps,  #
                  MASK: tl.constexpr):
     offs_m = start_m + tl.arange(0, BLOCK_M2)
-    offs_n = start_n + tl.arange(0, BLOCK_N2)
     offs_k = tl.arange(0, HEAD_DIM)
-    kT_ptrs = K + offs_n[None, :] * stride_tok + offs_k[:, None] * stride_d
-    vT_ptrs = V + offs_n[None, :] * stride_tok + offs_k[:, None] * stride_d
-    affinity_ptrs = AFFINITY + offs_m[:, None] * N_CTX + offs_n[None, :]
-    daffinity_ptrs = DAFFINITY + offs_m[:, None] * N_CTX + offs_n[None, :]
+    
     # D (= delta) is pre-divided by ds_scale.
     Di = tl.load(D + offs_m, mask=offs_m < N_CTX, other=0.0)
     # BLOCK_M2 must be a multiple of BLOCK_N2, otherwise the code wouldn't work.
     tl.static_assert(BLOCK_M2 % BLOCK_N2 == 0)
-    curr_n = start_n
-    step_n = BLOCK_N2
-    for blk_idx in range(num_steps):
-        offs_n = curr_n + tl.arange(0, BLOCK_N2)
-        kT = tl.load(kT_ptrs, mask=offs_n[None, :] < N_CTX)
-        vT = tl.load(vT_ptrs, mask=offs_n[None, :] < N_CTX)
-        affs = tl.load(affinity_ptrs, mask=(offs_m[:, None] < N_CTX) & (offs_n[None, :] < N_CTX), other=0.0) # (BLOCK_M2, BLOCK_N2)
-        qk = tl.dot(q, kT) + affs ## (BLOCK_M2, BLOCK_N2)
+
+    # Iterate over all key blocks from start_n up to effective_end (determined by num_steps)
+    for blk_idx in tl.range(0, num_steps):
+        offs_n = start_n + blk_idx * BLOCK_N2 + tl.arange(0, BLOCK_N2)
+
+        # Compute current pointers based on current offs_n
+        curr_kT_ptrs = K + offs_n[None, :] * stride_tok + offs_k[:, None] * stride_d
+        curr_vT_ptrs = V + offs_n[None, :] * stride_tok + offs_k[:, None] * stride_d
+        curr_affinity_ptrs = AFFINITY + offs_m[:, None] * N_CTX + offs_n[None, :]
+        curr_daffinity_ptrs = DAFFINITY + offs_m[:, None] * N_CTX + offs_n[None, :]
+
+        kT = tl.load(curr_kT_ptrs, mask=offs_n[None, :] < N_CTX)
+        vT = tl.load(curr_vT_ptrs, mask=offs_n[None, :] < N_CTX)
+        affs = tl.load(curr_affinity_ptrs, mask=(offs_m[:, None] < N_CTX) & (offs_n[None, :] < N_CTX), other=0.0)
+
+        qk = tl.dot(q, kT)
+        qk = qk * sm_scale
+        qk = qk + affs
         p = tl.math.exp(qk - m)
+
         if MASK:
             mask = (offs_m[:, None] >= offs_n[None, :]) & (offs_m[:, None] < N_CTX) & (offs_n[None, :] < N_CTX)
             p = tl.where(mask, p, 0.0)
-        # Compute dP and dS.
+
+        # Compute dP and dS
         dp = tl.dot(do, vT).to(tl.float32)
         ds = p * (dp - Di[:, None])
         ds = ds.to(K.dtype.element_ty)
-        ## Store to daffinity. ##
-        tl.store(daffinity_ptrs, ds, mask=(offs_m[:, None] < N_CTX) & (offs_n[None, :] < N_CTX))
-        # Compute dQ.
-        # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
+
+        # Store to daffinity
+        tl.store(curr_daffinity_ptrs, ds, mask=(offs_m[:, None] < N_CTX) & (offs_n[None, :] < N_CTX))
+
+        # Compute dQ
         dq += tl.dot(ds, tl.trans(kT))
-        # Increment pointers.
-        curr_n += step_n
-        kT_ptrs += step_n * stride_tok
-        vT_ptrs += step_n * stride_tok
-        affinity_ptrs += step_n  # Update affinity pointer to next block
-        daffinity_ptrs += step_n  # Update daffinity pointer to next block
+
     return dq
 
 @triton.jit
@@ -314,7 +325,8 @@ def _attn_bwd(Q, K, V, AFFINITY, sm_scale,  #
     DV += adj_KV
     # AFFINITY += ((bhid // (KV_H * Q_H)) * (KV_H * N_CTX * N_CTX) + (bhid % (KV_H)) * (N_CTX * N_CTX)).to(tl.int64)
     AFFINITY += (batch_idx * (KV_H * N_CTX * N_CTX) + kv_head_idx * (N_CTX * N_CTX)).to(tl.int64)
-    DAFFINITY += ((bhid // (KV_H * Q_H)) * ((Q_H * KV_H) * N_CTX * N_CTX) + (bhid % (KV_H * Q_H)) * (N_CTX * N_CTX)).to(tl.int64)
+    # DAFFINITY += ((bhid // (KV_H * Q_H)) * ((Q_H * KV_H) * N_CTX * N_CTX) + (bhid % (KV_H * Q_H)) * (N_CTX * N_CTX)).to(tl.int64)
+    DAFFINITY += (batch_idx * (Q_H * (KV_H * N_CTX * N_CTX)) + global_q_head_idx * (N_CTX * N_CTX)).to(tl.int64)
     ## Adjust these to batch dimension only since we need to loop through the "r" dimension for GQA. ##
     Q += ((bhid // (Q_H * KV_H)) * stride_z).to(tl.int64)
     DO += ((bhid // (Q_H * KV_H)) * stride_z).to(tl.int64)
@@ -345,12 +357,16 @@ def _attn_bwd(Q, K, V, AFFINITY, sm_scale,  #
 
         q_start_ptr = Q + (stride_h * global_q_head_idx).to(tl.int64)
         do_start_ptr = DO + (stride_h * global_q_head_idx).to(tl.int64)
+        # M and D need to point to the first query head in this GQA group
+        # off_chz was set to bhid * N_CTX, but for the dkdv loop we need M starting at kv_head_idx * Q_H * N_CTX
+        m_start_ptr = M - (global_q_head_idx * N_CTX).to(tl.int64) + (kv_head_idx * Q_H * N_CTX).to(tl.int64)
+        d_start_ptr = D - (global_q_head_idx * N_CTX).to(tl.int64) + (kv_head_idx * Q_H * N_CTX).to(tl.int64)
 
         dk, dv = _attn_bwd_dkdv(dk, dv,  #
-                            q_start_ptr, # Q + (stride_h * (bhid % KV_H)).to(tl.int64), 
-                            k, v, AFFINITY, sm_scale,  # Correctly point the necessary KV_H channel.
-                            do_start_ptr, # DO + (stride_h * (bhid % KV_H)).to(tl.int64),  # Correctly point to the necessary KV_H channel.
-                            M, D,  #
+                            q_start_ptr,
+                            k, v, AFFINITY, sm_scale,
+                            do_start_ptr,
+                            m_start_ptr, d_start_ptr,  # Use corrected M/D pointers
                             stride_tok, stride_d,  #
                             Q_H, KV_H, N_CTX,  #
                             BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
@@ -364,9 +380,9 @@ def _attn_bwd(Q, K, V, AFFINITY, sm_scale,  #
         # Compute dK and dV for non-masked blocks.
         dk, dv = _attn_bwd_dkdv(  #
             dk, dv,  #
-            Q + stride_h * (bhid % (Q_H * KV_H)).to(tl.int64), k, v, AFFINITY, sm_scale,  #
-            DO + stride_h * (bhid % (Q_H * KV_H)).to(tl.int64),  #
-            M, D,  #
+            q_start_ptr, k, v, AFFINITY, sm_scale,  #
+            do_start_ptr,  #
+            m_start_ptr, d_start_ptr,  # Use same corrected M/D pointers
             stride_tok, stride_d,  #
             Q_H, KV_H, N_CTX,  #
             BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
@@ -392,16 +408,58 @@ def _attn_bwd(Q, K, V, AFFINITY, sm_scale,  #
     do = tl.load(DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d + stride_h * (bhid % (Q_H * KV_H)), mask=offs_m[:, None] < N_CTX)
     m = tl.load(M + offs_m, mask=offs_m < N_CTX)[:, None]
 
-    # For causal attention, the q-block iterates backward over keys from the diagonal.
+    # For causal attention, the q-block iterates over keys from 0 to the diagonal.
     # The highest key index this query block can see is limited by N_CTX.
     effective_end_n = tl.minimum(start_m + BLOCK_M2, N_CTX)
 
-    num_steps = tl.cdiv(effective_end_n, BLOCK_N2)
-    dq = _attn_bwd_dq(
-        dq, q, K, V, AFFINITY, do, DAFFINITY, m, D,
-        stride_tok, stride_d, Q_H, N_CTX, BLOCK_M2, BLOCK_N2, HEAD_DIM,
-        start_m, 0, num_steps, MASK=True
-    )
+    # Compute num_steps and convert to int32 explicitly to avoid potential type issues
+    num_steps = (effective_end_n + BLOCK_N2 - 1) // BLOCK_N2
+
+    # Inline the dq computation instead of calling _attn_bwd_dq to avoid potential
+    # issues with passing runtime values to inner functions
+    offs_k_dq = tl.arange(0, HEAD_DIM)
+    Di = tl.load(D + offs_m, mask=offs_m < N_CTX, other=0.0)
+
+    # Iterate over key blocks
+    # Max iterations needed: for last pid, we need to cover all N_CTX keys
+    # N_CTX / BLOCK_N2 iterations max. With N_CTX=128, BLOCK_N2=32, max=4
+    # Use a conservative upper bound based on typical sequence lengths
+    MAX_KEY_BLOCKS: tl.constexpr = 32  # Supports up to N_CTX=1024 with BLOCK_N2=32
+    for blk_idx in tl.static_range(MAX_KEY_BLOCKS):  # Use compile-time max bound
+        # Check if this iteration should execute
+        if blk_idx < num_steps:
+            # Use different variable name to avoid conflict with offs_n from dkdv section
+            key_offs = blk_idx * BLOCK_N2 + tl.arange(0, BLOCK_N2)
+
+            # Compute pointers for this key block
+            curr_kT_ptrs = K + key_offs[None, :] * stride_tok + offs_k_dq[:, None] * stride_d
+            curr_vT_ptrs = V + key_offs[None, :] * stride_tok + offs_k_dq[:, None] * stride_d
+            curr_affinity_ptrs = AFFINITY + offs_m[:, None] * N_CTX + key_offs[None, :]
+            curr_daffinity_ptrs = DAFFINITY + offs_m[:, None] * N_CTX + key_offs[None, :]
+
+            kT = tl.load(curr_kT_ptrs, mask=key_offs[None, :] < N_CTX)
+            vT = tl.load(curr_vT_ptrs, mask=key_offs[None, :] < N_CTX)
+            affs = tl.load(curr_affinity_ptrs, mask=(offs_m[:, None] < N_CTX) & (key_offs[None, :] < N_CTX), other=0.0)
+
+            qk = tl.dot(q, kT)
+            qk = qk * sm_scale
+            qk = qk + affs
+            p = tl.math.exp(qk - m)
+
+            # Apply causal mask
+            causal_mask = (offs_m[:, None] >= key_offs[None, :]) & (offs_m[:, None] < N_CTX) & (key_offs[None, :] < N_CTX)
+            p = tl.where(causal_mask, p, 0.0)
+
+            # Compute dP and dS
+            dp = tl.dot(do, vT).to(tl.float32)
+            ds = p * (dp - Di[:, None])
+            ds = ds.to(K.dtype.element_ty)
+
+            # Store to daffinity
+            tl.store(curr_daffinity_ptrs, ds, mask=(offs_m[:, None] < N_CTX) & (key_offs[None, :] < N_CTX))
+
+            # Compute dQ
+            dq += tl.dot(ds, tl.trans(kT))
 
     # Write back dQ.
     dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
@@ -417,6 +475,9 @@ class _attention(torch.autograd.Function):
         assert q.shape[2] % 128 == 0, 'Only works for multiples of 128!'
         # shape constraints
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
+        # Ground truth UniversalAttention doesn't apply scale to QK product
+        # Honor the passed sm_scale (use 1.0 if no scaling desired, like ground truth)
+        # sm_scale = 1.0 / (HEAD_DIM_K ** 0.5) # pytorch default - but ground truth uses no scale
         # when v is in float8_e5m2 it is transposed.
         HEAD_DIM_V = v.shape[-1]
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
@@ -521,14 +582,15 @@ class _attention(torch.autograd.Function):
         )
 
         ## Recompute affinity scores. ##
-        #affinity = _affinity_fwd(k, static_src, static_dest)
-        with torch.enable_grad():
-            affinity = _gen_affinity_scores(k, static_src, static_dest)
+        affinity = _affinity_fwd(k, static_src, static_dest).contiguous()
+        # with torch.enable_grad():
+        #     affinity = _gen_affinity_scores(k, static_src, static_dest)
 
         daffinity = torch.zeros(affinity.shape[0], Q_H * KV_H, N_CTX, N_CTX, dtype=affinity.dtype, device=affinity.device)
 
         grid = (triton.cdiv(N_CTX, BLOCK_N1), 1, BATCH * N_HEAD)
-        scale = 1.0 / ctx.HEAD_DIM**0.5
+        # Use the same scale as forward pass (stored in ctx.sm_scale)
+        scale = ctx.sm_scale
         _attn_bwd[grid](
             q, k, v, affinity, scale, do, dq, dk, dv, daffinity,  #
             M, delta,  #
@@ -543,12 +605,12 @@ class _attention(torch.autograd.Function):
             num_stages=NUM_STAGES  #
         )
 
-        daffinity = torch.reshape(daffinity, (daffinity.shape[0], Q_H, KV_H, daffinity.shape[2], daffinity.shape[3])).sum(1, keepdim=False)
+        daffinity = torch.reshape(daffinity, (daffinity.shape[0], KV_H, Q_H, daffinity.shape[2], daffinity.shape[3])).sum(2, keepdim=False)
 
-        #dk_new, dsrc, ddest = _affinity_bwd(k, static_src, static_dest, daffinity)
-        dk_new, dsrc, ddest = torch.autograd.grad(affinity, [k, static_src, static_dest], grad_outputs=daffinity)
+        dk_new, dsrc, ddest = _affinity_bwd(k, static_src, static_dest, daffinity)
+        # dk_new, dsrc, ddest = torch.autograd.grad(affinity, [k, static_src, static_dest], grad_outputs=daffinity)
         dk += dk_new
-        print(f'dq_grad: {dq.sum()}, dk_grad: {dk.sum()}, dv_grad: {dv.sum()}, dsrc: {dsrc.sum()}, ddest: {ddest.sum()}')
+        # print(f'dq_grad: {dq.sum()}, dk_grad: {dk.sum()}, dv_grad: {dv.sum()}, dsrc: {dsrc.sum()}, ddest: {ddest.sum()}')
         return dq[:, :, :, :ctx.HEAD_DIM], dk[:,:,:,:ctx.HEAD_DIM], dv[:,:,:,:ctx.HEAD_DIM], None, None, dsrc, ddest, None
 
 attention = _attention.apply
