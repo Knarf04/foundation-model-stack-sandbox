@@ -575,11 +575,10 @@ class MultiHeadAttention(nn.Module):
         if past_key_value_state is not None:
             # Iterative universal attention
             assert q_len == 1, "UA decoding not currently supported for more than 1 token"
-            # thresh = math.log(1e-4)
             (k, v, r, a) = past_key_value_state  # bhld, bhld, bhl, bhl
             k_ = keys.squeeze(1)  # b h d
             v_ = values.squeeze(1)  # b h d
-            q = queries.view(batch_size, self.kvheads, -1, self.emb_kq_per_head)  # b h r d
+            q_ = queries.view(batch_size, -1, self.kvheads, self.emb_kq_per_head).transpose(1, 2)  # b h r d
             static_src = static_src.squeeze(2)  # b h
             static_dest = static_dest.squeeze(2)  # b h
 
@@ -588,7 +587,7 @@ class MultiHeadAttention(nn.Module):
             v = torch.cat((v, v_.unsqueeze(2)), dim=2)
 
             # q/k/k products
-            qkkk = k.matmul(torch.cat([q,k_.unsqueeze(2)], dim=2).transpose(-1,-2))  # b h l+1 r+1
+            qkkk = k.matmul(torch.cat([q_, k_.unsqueeze(2)], dim=2).transpose(-1,-2))  # b h l+1 r+1
             qk = qkkk[...,:-1]  # b h l+1 r
             kk = qkkk[:,:,:-1,-1]  # b h l
 
@@ -602,9 +601,15 @@ class MultiHeadAttention(nn.Module):
             r = torch.cat((r, static_src.unsqueeze(2)), dim=2)
             a = torch.cat((a, torch.zeros(batch_size, self.kvheads, 1, device=a.device, dtype=a.dtype)), dim=2)
 
+            # Apply pruning
+            a_mask = a
+            if self.prune:
+                a_mask = a.masked_fill(a.lt(math.log(self.thresh)), float('-inf'))
+
             # Perform scaled attention
-            attn = qk.float().add(a.unsqueeze(-1)).softmax(dim=2).to(dtype=v.dtype).transpose(-1,-2).matmul(v)  # b h r d
-            (keys, values, rates, affs) = k,v,r,a
+            attn = qk.float().add(a_mask.unsqueeze(-1)).softmax(dim=2).to(dtype=v.dtype).transpose(-1,-2).matmul(v)  # b h r d
+            attn = attn.transpose(1, 2).contiguous()  # b r h d
+            (keys, values, rates, affs) = k, v, r, a
             
         else:
             # Blockwise universal attention
