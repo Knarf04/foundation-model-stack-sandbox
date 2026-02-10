@@ -614,7 +614,7 @@ class MultiHeadAttention(nn.Module):
             rates = static_src
 
             r = self.nheads // self.kvheads
-            mask, aux = self._gen_affinity_scores(keys, static_src, static_dest, r)  # b h l_q l_k
+            mask, affs, aux = self._gen_affinity_scores(keys, static_src, static_dest, r)  # b h l_q l_k
 
             # affs = mask.view(batch_size, self.kvheads, -1, mask.size(-2), mask.size(-1))[:,:,0].exp()  # b h l l
             # affsm = affs.mean()
@@ -684,11 +684,12 @@ class MultiHeadAttention(nn.Module):
         affinity = torch.einsum('bnqh, bnkh -> bnqk', k*dest.sqrt().unsqueeze(-1), k*src.sqrt().unsqueeze(-1)).relu().float().pow(2/3)
         affinity = torch.log1p(affinity.clamp(min=0, max=1-1e-6).neg())
         affinity = affinity.tril(-1).cumsum(2).to(dtype=k.dtype)
-        affs = affinity[:,:,-1].exp().gt(self.thresh).to(affinity.dtype).mean()
+        cache_affs = affinity[:,:,-1]  # b h l — accumulated decay from last position, for cache init
+        aux = cache_affs.exp().gt(self.thresh).to(affinity.dtype).mean()
         affinity = affinity.masked_fill(torch.ones_like(affinity, dtype=torch.bool).triu(1), float('-inf'))
         if self.prune:
             affinity = affinity.masked_fill(affinity.lt(math.log(self.thresh)), float('-inf'))  # ACTUAL MASKING
-        return affinity.repeat(1,r,1,1), affs
+        return affinity.repeat(1,r,1,1), cache_affs, aux
         
 
 
