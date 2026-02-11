@@ -628,14 +628,48 @@ class MultiHeadAttention(nn.Module):
             #     aux = aux * (2 * q_len / (q_len+1))
             # aux = aux.sub(affsm.detach()).add(affsm)
 
-            torch.backends.cuda.enable_math_sdp(False)
-            attn = F.scaled_dot_product_attention(
-                queries, 
-                keys.repeat(1,r,1,1),
-                values.repeat(1,r,1,1),
-                attn_mask=mask,  # torch.repeat_interleave(mask,r,dim=1),
-                scale=1,
-            )  # b h l d
+            chunk_size = 4096
+            if q_len <= chunk_size:
+                torch.backends.cuda.enable_math_sdp(False)
+                attn = F.scaled_dot_product_attention(
+                    queries, keys.repeat(1,r,1,1), values.repeat(1,r,1,1),
+                    attn_mask=mask, scale=1,
+                )  # b h l d
+            else:
+                # Chunked attention with online softmax — O(chunk_size^2) peak memory per iteration
+                n_chunks = (q_len + chunk_size - 1) // chunk_size
+                attn_chunks = []
+                for i in range(n_chunks):
+                    qi = i * chunk_size
+                    qj = min(qi + chunk_size, q_len)
+                    q_chunk = queries[:, :, qi:qj, :]  # b h c_q d
+                    c_q = qj - qi
+                    # Accumulators in float32 for numerical stability
+                    o_acc = torch.zeros(batch_size, self.nheads, c_q, self.emb_v_per_head,
+                                        device=queries.device, dtype=torch.float32)
+                    l_acc = torch.zeros(batch_size, self.nheads, c_q, 1,
+                                        device=queries.device, dtype=torch.float32)
+                    m_acc = torch.full((batch_size, self.nheads, c_q, 1), float('-inf'),
+                                       device=queries.device, dtype=torch.float32)
+                    # Causal: only key chunks 0..i contribute (later chunks are -inf in mask)
+                    for j in range(i + 1):
+                        ki = j * chunk_size
+                        kj = min(ki + chunk_size, q_len)
+                        k_chunk = keys[:, :, ki:kj, :].repeat(1, r, 1, 1)    # b nheads c_k d
+                        v_chunk = values[:, :, ki:kj, :].repeat(1, r, 1, 1)  # b nheads c_k d_v
+                        mask_chunk = mask[:, :, qi:qj, ki:kj]                 # b nheads c_q c_k
+                        # Scores: b h c_q c_k
+                        scores = (q_chunk @ k_chunk.transpose(-1, -2)).float() + mask_chunk.float()
+                        # Online softmax update
+                        chunk_max = scores.amax(dim=-1, keepdim=True)          # b h c_q 1
+                        m_new = torch.maximum(m_acc, chunk_max)
+                        exp_scores = torch.exp(scores - m_new).nan_to_num_(0.0)
+                        exp_old = torch.exp(m_acc - m_new).nan_to_num_(0.0)    # b h c_q 1
+                        l_acc = l_acc * exp_old + exp_scores.sum(dim=-1, keepdim=True)
+                        o_acc = o_acc * exp_old + exp_scores @ v_chunk.float()
+                        m_acc = m_new
+                    attn_chunks.append((o_acc / l_acc).to(queries.dtype))
+                attn = torch.cat(attn_chunks, dim=2)  # b h l d
             attn = attn.transpose(1,2).contiguous()  # b l h d
 
             # c = 512
