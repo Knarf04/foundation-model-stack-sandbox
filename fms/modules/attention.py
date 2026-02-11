@@ -619,57 +619,85 @@ class MultiHeadAttention(nn.Module):
             rates = static_src
 
             r = self.nheads // self.kvheads
-            mask, affs, aux = self._gen_affinity_scores(keys, static_src, static_dest, r)  # b h l_q l_k
-
-            # affs = mask.view(batch_size, self.kvheads, -1, mask.size(-2), mask.size(-1))[:,:,0].exp()  # b h l l
-            # affsm = affs.mean()
-            # with torch.no_grad():
-            #     aux = affs.gt(.001).to(dtype=affs.dtype).mean()  # *l*l / (l*(l+1)/2)  =  *2l/(l+1)
-            #     aux = aux * (2 * q_len / (q_len+1))
-            # aux = aux.sub(affsm.detach()).add(affsm)
 
             chunk_size = 4096
+
             if q_len <= chunk_size:
+                mask, affs, aux = self._gen_affinity_scores(keys, static_src, static_dest, r)
                 torch.backends.cuda.enable_math_sdp(False)
                 attn = F.scaled_dot_product_attention(
                     queries, keys.repeat(1,r,1,1), values.repeat(1,r,1,1),
                     attn_mask=mask, scale=1,
                 )  # b h l d
             else:
-                # Chunked attention with online softmax — O(chunk_size^2) peak memory per iteration
+                # Fused chunked attention — O(chunk_size^2) peak memory, no O(l^2) mask
+                # Computes affinity on-the-fly via prefix sums instead of materializing full l x l
+                k_dest = keys * static_dest.unsqueeze(-1).sqrt()  # b h l d
+                k_src = keys * static_src.unsqueeze(-1).sqrt()    # b h l d
                 n_chunks = (q_len + chunk_size - 1) // chunk_size
+                # prefix[k] tracks cumulative decay to key k from all processed query positions
+                prefix = torch.zeros(batch_size, self.kvheads, q_len,
+                                     device=keys.device, dtype=torch.float32)
                 attn_chunks = []
                 for i in range(n_chunks):
                     qi = i * chunk_size
                     qj = min(qi + chunk_size, q_len)
-                    q_chunk = queries[:, :, qi:qj, :]  # b h c_q d
                     c_q = qj - qi
-                    # Accumulators in float32 for numerical stability
+                    q_chunk = queries[:, :, qi:qj, :]  # b nheads c_q d
+                    # Online softmax accumulators (float32)
                     o_acc = torch.zeros(batch_size, self.nheads, c_q, self.emb_v_per_head,
                                         device=queries.device, dtype=torch.float32)
                     l_acc = torch.zeros(batch_size, self.nheads, c_q, 1,
                                         device=queries.device, dtype=torch.float32)
                     m_acc = torch.full((batch_size, self.nheads, c_q, 1), float('-inf'),
                                        device=queries.device, dtype=torch.float32)
-                    # Causal: only key chunks 0..i contribute (later chunks are -inf in mask)
                     for j in range(i + 1):
                         ki = j * chunk_size
                         kj = min(ki + chunk_size, q_len)
-                        k_chunk = keys[:, :, ki:kj, :].repeat(1, r, 1, 1)    # b nheads c_k d
-                        v_chunk = values[:, :, ki:kj, :].repeat(1, r, 1, 1)  # b nheads c_k d_v
-                        mask_chunk = mask[:, :, qi:qj, ki:kj]                 # b nheads c_q c_k
-                        # Scores: b h c_q c_k
-                        scores = (q_chunk @ k_chunk.transpose(-1, -2)).float() + mask_chunk.float()
+                        c_k = kj - ki
+                        # Pairwise log-decay: (b, kvheads, c_q, c_k) — O(c^2) memory
+                        log_decay = torch.einsum(
+                            'bhqd, bhkd -> bhqk',
+                            k_dest[:, :, qi:qj], k_src[:, :, ki:kj]
+                        )
+                        log_decay = torch.log1p(
+                            log_decay.relu().float().pow(2/3).clamp(max=1-1e-6).neg()
+                        )
+                        if j == i:
+                            log_decay = log_decay.tril(-1)
+                        # Affinity = prefix (accumulated to chunk boundary) + local cumsum
+                        local_cumsum = log_decay.cumsum(dim=2)  # b h c_q c_k
+                        chunk_aff = prefix[:, :, ki:kj].unsqueeze(2) + local_cumsum
+                        if j == i:
+                            chunk_aff.masked_fill_(
+                                torch.ones(c_q, c_k, dtype=torch.bool, device=keys.device).triu(1),
+                                float('-inf')
+                            )
+                        chunk_aff = chunk_aff.to(dtype=keys.dtype)
+                        if self.prune:
+                            chunk_aff = chunk_aff.masked_fill(
+                                chunk_aff.lt(math.log(self.thresh)), float('-inf')
+                            )
+                        # Repeat for GQA and compute attention
+                        chunk_aff = chunk_aff.repeat(1, r, 1, 1)        # b nheads c_q c_k
+                        k_chunk = keys[:, :, ki:kj, :].repeat(1, r, 1, 1)
+                        v_chunk = values[:, :, ki:kj, :].repeat(1, r, 1, 1)
+                        scores = (q_chunk @ k_chunk.transpose(-1, -2)).float() + chunk_aff.float()
                         # Online softmax update
-                        chunk_max = scores.amax(dim=-1, keepdim=True)          # b h c_q 1
+                        chunk_max = scores.amax(dim=-1, keepdim=True)
                         m_new = torch.maximum(m_acc, chunk_max)
-                        exp_scores = torch.exp(scores - m_new).nan_to_num_(0.0)
-                        exp_old = torch.exp(m_acc - m_new).nan_to_num_(0.0)    # b h c_q 1
+                        exp_scores = torch.exp(scores - m_new).nan_to_num(0.0)
+                        exp_old = torch.exp(m_acc - m_new).nan_to_num(0.0)
                         l_acc = l_acc * exp_old + exp_scores.sum(dim=-1, keepdim=True)
                         o_acc = o_acc * exp_old + exp_scores @ v_chunk.float()
                         m_acc = m_new
+                        # Update prefix: accumulate decay from query chunk i to keys in chunk j
+                        prefix[:, :, ki:kj] += local_cumsum[:, :, -1, :]
                     attn_chunks.append((o_acc / l_acc).to(queries.dtype))
                 attn = torch.cat(attn_chunks, dim=2)  # b h l d
+                # prefix now holds cumulative decay at last position for each key = cache_affs
+                affs = prefix.to(dtype=keys.dtype)
+                aux = prefix.exp().gt(self.thresh).to(keys.dtype).mean()
             attn = attn.transpose(1,2).contiguous()  # b l h d
 
             # c = 512
