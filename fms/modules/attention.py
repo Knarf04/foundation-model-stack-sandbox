@@ -700,6 +700,13 @@ class MultiHeadAttention(nn.Module):
                 aux = prefix.exp().gt(self.thresh).to(keys.dtype).mean()
             attn = attn.transpose(1,2).contiguous()  # b l h d
 
+            # Record prefill pruning stats per head (tokens pruned from last position's view)
+            if self.prune:
+                with torch.no_grad():
+                    surviving_per_head = affs.exp().gt(self.thresh).long().sum(dim=-1)  # b h
+                    pruned_per_head = q_len - surviving_per_head.float().mean(dim=0)  # h
+                    self._prefill_prune_stats = (pruned_per_head.long().tolist(), q_len)
+
             # c = 512
             # b = batch_size
             # # Right-pad k,v,src if len not divisible by chunksize
