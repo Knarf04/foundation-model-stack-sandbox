@@ -605,6 +605,12 @@ class MultiHeadAttention(nn.Module):
             a_mask = a
             if self.prune:
                 a_mask = a.masked_fill(a.lt(math.log(self.thresh)), float('-inf'))
+                # Record decode pruning stats (overwrites each step; final state persists)
+                with torch.no_grad():
+                    cache_len = a.size(-1)
+                    surviving_per_head = a.ge(math.log(self.thresh)).long().sum(dim=-1)  # b h
+                    pruned_per_head = cache_len - surviving_per_head.float().mean(dim=0)  # h
+                    self._decode_prune_stats = (pruned_per_head.long().tolist(), cache_len)
 
             # Perform scaled attention
             attn = qk.float().add(a_mask.unsqueeze(-1)).softmax(dim=2).to(dtype=v.dtype).transpose(-1,-2).matmul(v)  # b h r d
