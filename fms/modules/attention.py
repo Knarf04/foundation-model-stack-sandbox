@@ -465,6 +465,7 @@ class MultiHeadAttention(nn.Module):
         
         self.thresh = prune_thresh
         self.prune = prune
+        self._analysis_thresholds = [prune_thresh]  # can be overridden externally
 
         self.in_proj: QKV = (FusedQKV if self.fused else UnfusedQKV)(
             self.emb_dim,
@@ -706,12 +707,16 @@ class MultiHeadAttention(nn.Module):
                 aux = prefix.exp().gt(self.thresh).to(keys.dtype).mean()
             attn = attn.transpose(1,2).contiguous()  # b l h d
 
-            # Record prefill pruning stats per head (tokens pruned from last position's view)
+            # Record prefill pruning stats per head for each analysis threshold
             if self.prune:
                 with torch.no_grad():
-                    surviving_per_head = affs.exp().gt(self.thresh).long().sum(dim=-1)  # b h
-                    pruned_per_head = q_len - surviving_per_head.float().mean(dim=0)  # h
-                    self._prefill_prune_stats = (pruned_per_head.long().tolist(), q_len)
+                    affs_exp = affs.exp()  # b h l
+                    stats = {}
+                    for t in self._analysis_thresholds:
+                        surviving = affs_exp.gt(t).long().sum(dim=-1)  # b h
+                        pruned = q_len - surviving.float().mean(dim=0)  # h
+                        stats[t] = pruned.long().tolist()
+                    self._prefill_prune_stats = (stats, q_len)
 
             # c = 512
             # b = batch_size
