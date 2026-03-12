@@ -587,10 +587,9 @@ class MultiHeadAttention(nn.Module):
             qk = qkkk[...,:-1]  # b h l+1 r
             kk = qkkk[:,:,:-1,-1]  # b h l
 
-            # Calculate decays
-            decay = kk.relu().float().pow(2)
-            decay = (decay * r * static_dest.unsqueeze(-1)).pow(1/3)
-            decay = torch.log1p(decay.clamp(min=0, max=1-1e-6).neg())
+            # Calculate decays: sqrt(dest) * sqrt(src), matching prefill affinity
+            decay = static_dest.unsqueeze(-1).sqrt() * r.sqrt()
+            decay = torch.log1p(decay.relu().float().clamp(min=0, max=1-1e-6).neg())
             a = a + decay
 
             # Update r/a cache
