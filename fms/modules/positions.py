@@ -239,8 +239,8 @@ class RopeYaRNScalingImpl(RopeNoScalingImpl):
 
     def get_alpha(self, current_max_seq_len: int) -> int:
         # Dynamic: derive factor from actual vs original context length.
-        # Store the precise seq len so compute_scaled_freqs can use the real ratio.
-        self._current_max_seq_len = current_max_seq_len
+        # alpha is used as a cache bucket key — all seq lens within the same
+        # alpha bucket share the same freqs (factor = alpha).
         alpha = math.ceil(current_max_seq_len / self.orig_max_seq_len)
         alpha = max(alpha, 1)
         return alpha
@@ -249,8 +249,10 @@ class RopeYaRNScalingImpl(RopeNoScalingImpl):
         return max(current_max_seq_len, self.orig_max_seq_len * alpha)
 
     def compute_scaled_freqs(self, device: str, alpha: int):
-        factor = self._current_max_seq_len / self.orig_max_seq_len
-        factor = max(factor, 1.0)
+        # factor = alpha, the integer ceiling of seq_len / orig_seq_len.
+        # This keeps freqs stable within a bucket (e.g. alpha=2 → factor=2
+        # for all seq lens in (4096, 8192]).
+        factor = float(alpha)
         beta_fast = self.scaling_info.get("beta_fast", 35)
         beta_slow = self.scaling_info.get("beta_slow", 0.7)
 
@@ -337,18 +339,17 @@ class RotaryEmbedding(PositionEncoder):
             self.max_seq_len_cached[dev_idx] = 0
 
         if alpha not in self.cached_freqs[dev_idx]:
-            # This avoids a graph break from computing scaled_max_seq_len if not needed
             scaled_max_seq_len = self.rope_scaling.scaled_max_seq_len(
                 max_seq_len, alpha
             )
+            # Always compute when alpha is unseen — different alphas may
+            # produce different frequency bases (e.g. YaRN, NTK).
+            freqs = self.rope_scaling.compute_scaled_freqs(device, alpha)
+            t = torch.arange(scaled_max_seq_len, device=device, dtype=freqs.dtype)
+            freqs = torch.outer(t, freqs).float()
             if scaled_max_seq_len > self.max_seq_len_cached[dev_idx]:
-                # This only runs if a particular combination of alpha
-                # and max_seq_len hasn't been seen before
-                freqs = self.rope_scaling.compute_scaled_freqs(device, alpha)
-                t = torch.arange(scaled_max_seq_len, device=device, dtype=freqs.dtype)
-                freqs = torch.outer(t, freqs).float()
                 self.max_seq_len_cached[dev_idx] = scaled_max_seq_len
-                self.cached_freqs[dev_idx][alpha] = torch.stack(
+            self.cached_freqs[dev_idx][alpha] = torch.stack(
                     [
                         torch.cos(freqs),
                         -torch.sin(freqs),
