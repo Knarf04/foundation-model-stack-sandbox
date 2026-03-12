@@ -1,7 +1,7 @@
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Optional, Tuple
+from typing import Any, List, Mapping, Optional, Tuple, Union
 from typing_extensions import Unpack
 
 import torch
@@ -58,12 +58,12 @@ class LLaMAConfig(ModelConfig):
     rope_partial: float = 1.0
     linear_config: Optional[Mapping[str, Any]] = None
     fused_weights: bool = True
-    prune_thresh: float = .001
+    prune_topk: Union[int, List[int]] = 512
     prune: bool = True
 
 
 class LLaMABlock(nn.Module):
-    def __init__(self, config: LLaMAConfig, rotary_emb: RotaryEmbedding):
+    def __init__(self, config: LLaMAConfig, rotary_emb: RotaryEmbedding, layer_idx: int = 0):
         super(LLaMABlock, self).__init__()
         self.config = config
         emb_kq = self.config.emb_dim // self.config.nheads
@@ -92,6 +92,15 @@ class LLaMABlock(nn.Module):
             kvheads = self.config.kvheads
             assert self.config.nheads % self.config.kvheads == 0
 
+        if isinstance(self.config.prune_topk, list):
+            assert len(self.config.prune_topk) == self.config.nlayers, (
+                f"prune_topk list length ({len(self.config.prune_topk)}) "
+                f"must match nlayers ({self.config.nlayers})"
+            )
+            layer_topk = self.config.prune_topk[layer_idx]
+        else:
+            layer_topk = self.config.prune_topk
+
         self.attn = MultiHeadAttention(
             self.config.emb_dim,
             emb_kq,
@@ -104,7 +113,7 @@ class LLaMABlock(nn.Module):
             fused=self.config.fused_weights,
             linear_config=self.config.linear_config,
             prune=self.config.prune,
-            prune_thresh=self.config.prune_thresh,
+            prune_topk=layer_topk,
         )
         self.ff_sub_layer = GatedLinearUnit(
             self.config.emb_dim,
@@ -229,7 +238,7 @@ class LLaMA(nn.Module):
 
         layers = []
         for i in range(self.config.nlayers):
-            block: nn.Module = LLaMABlock(self.config, self.rot_emb)
+            block: nn.Module = LLaMABlock(self.config, self.rot_emb, layer_idx=i)
             block = self.distributed_strategy.distribute_layer(block, i)
             layers.append(block)
         self.layers = nn.ModuleList(layers)
