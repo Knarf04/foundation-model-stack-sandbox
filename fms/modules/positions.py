@@ -238,15 +238,19 @@ class RopeYaRNScalingImpl(RopeNoScalingImpl):
         return ((t - min_val) / (max_val - min_val)).clamp(0, 1)
 
     def get_alpha(self, current_max_seq_len: int) -> int:
-        factor = self.scaling_info.get("factor", 1)
-        return int(math.ceil(factor))
+        # Dynamic: derive factor from actual vs original context length.
+        # Store the precise seq len so compute_scaled_freqs can use the real ratio.
+        self._current_max_seq_len = current_max_seq_len
+        alpha = math.ceil(current_max_seq_len / self.orig_max_seq_len)
+        alpha = max(alpha, 1)
+        return alpha
 
     def scaled_max_seq_len(self, current_max_seq_len: int, alpha: int):
-        factor = self.scaling_info.get("factor", 1)
-        return max(current_max_seq_len, int(self.orig_max_seq_len * factor))
+        return max(current_max_seq_len, self.orig_max_seq_len * alpha)
 
     def compute_scaled_freqs(self, device: str, alpha: int):
-        factor = self.scaling_info.get("factor", 1.0)
+        factor = self._current_max_seq_len / self.orig_max_seq_len
+        factor = max(factor, 1.0)
         beta_fast = self.scaling_info.get("beta_fast", 35)
         beta_slow = self.scaling_info.get("beta_slow", 0.7)
 
