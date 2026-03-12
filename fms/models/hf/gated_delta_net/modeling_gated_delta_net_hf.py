@@ -32,8 +32,11 @@ class HFAdaptedGDNDecoder(HFDecoder):
         *args,
         **kwargs,
     ) -> BaseModelOutputWithPastAndCrossAttentions:
-        # Delegate to the fla GatedDeltaNetModel forward which returns
-        # BaseModelOutputWithPast (last_hidden_state, past_key_values, ...)
+        # fla expects attention_mask as 2D [batch, seq_len] or None.
+        # The base adapter expands it to 3D causal; convert back for fla.
+        if attention_mask is not None and attention_mask.dim() > 2:
+            attention_mask = None
+
         fla_output = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
