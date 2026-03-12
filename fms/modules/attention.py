@@ -574,7 +574,7 @@ class MultiHeadAttention(nn.Module):
             (k, v, r, a) = past_key_value_state  # bhld, bhld, bhl, bhl
             k_ = keys.squeeze(1)  # b h d
             v_ = values.squeeze(1)  # b h d
-            q = queries.view(batch_size, self.kvheads, -1, self.emb_kq_per_head)  # b h r d
+            q_ = queries.view(batch_size, -1, self.kvheads, self.emb_kq_per_head).transpose(1, 2)  # b h r d
             static_src = static_src.squeeze(2)  # b h
             static_dest = static_dest.squeeze(2)  # b h
 
@@ -583,7 +583,7 @@ class MultiHeadAttention(nn.Module):
             v = torch.cat((v, v_.unsqueeze(2)), dim=2)
 
             # q/k/k products
-            qkkk = k.matmul(torch.cat([q,k_.unsqueeze(2)], dim=2).transpose(-1,-2))  # b h l+1 r+1
+            qkkk = k.matmul(torch.cat([q_,k_.unsqueeze(2)], dim=2).transpose(-1,-2))  # b h l+1 r+1
             qk = qkkk[...,:-1]  # b h l+1 r
             kk = qkkk[:,:,:-1,-1]  # b h l
 
@@ -599,7 +599,8 @@ class MultiHeadAttention(nn.Module):
 
             # Perform scaled attention
             attn = qk.float().add(a.unsqueeze(-1)).softmax(dim=2).to(dtype=v.dtype).transpose(-1,-2).matmul(v)  # b h r d
-            (keys, values, rates, affs) = k,v,r,a
+            attn = attn.transpose(1, 2).contiguous()  # b r h d
+            (keys, values, rates, affs) = k, v, r, a
             
         else:
             # Blockwise universal attention
@@ -609,61 +610,79 @@ class MultiHeadAttention(nn.Module):
             rates = static_src
 
             r = self.nheads // self.kvheads
-            mask, aux = self._gen_affinity_scores(keys, static_src, static_dest, r)  # b h l_q l_k
 
-            # affs = mask.view(batch_size, self.kvheads, -1, mask.size(-2), mask.size(-1))[:,:,0].exp()  # b h l l
-            # affsm = affs.mean()
-            # with torch.no_grad():
-            #     aux = affs.gt(.001).to(dtype=affs.dtype).mean()  # *l*l / (l*(l+1)/2)  =  *2l/(l+1)
-            #     aux = aux * (2 * q_len / (q_len+1))
-            # aux = aux.sub(affsm.detach()).add(affsm)
+            chunk_size = 4096
 
-            torch.backends.cuda.enable_math_sdp(False)
-            attn = F.scaled_dot_product_attention(
-                queries, 
-                keys.repeat(1,r,1,1),
-                values.repeat(1,r,1,1),
-                attn_mask=mask,  # torch.repeat_interleave(mask,r,dim=1),
-                scale=1,
-            )  # b h l d
+            if q_len <= chunk_size:
+                mask, affs, aux = self._gen_affinity_scores(keys, static_src, static_dest, r)
+                torch.backends.cuda.enable_math_sdp(False)
+                attn = F.scaled_dot_product_attention(
+                    queries, keys.repeat(1,r,1,1), values.repeat(1,r,1,1),
+                    attn_mask=mask, scale=1,
+                )  # b h l d
+            else:
+                # Fused chunked attention — O(chunk_size^2) peak memory, no O(l^2) mask
+                # Computes affinity on-the-fly via prefix sums instead of materializing full l x l
+                n_chunks = (q_len + chunk_size - 1) // chunk_size
+                # prefix[k] tracks cumulative decay to key k from all processed query positions
+                prefix = torch.zeros(batch_size, self.kvheads, q_len,
+                                     device=keys.device, dtype=torch.float32)
+                attn_chunks = []
+                for i in range(n_chunks):
+                    qi = i * chunk_size
+                    qj = min(qi + chunk_size, q_len)
+                    c_q = qj - qi
+                    q_chunk = queries[:, :, qi:qj, :]  # b nheads c_q d
+                    # Online softmax accumulators (float32)
+                    o_acc = torch.zeros(batch_size, self.nheads, c_q, self.emb_v_per_head,
+                                        device=queries.device, dtype=torch.float32)
+                    l_acc = torch.zeros(batch_size, self.nheads, c_q, 1,
+                                        device=queries.device, dtype=torch.float32)
+                    m_acc = torch.full((batch_size, self.nheads, c_q, 1), float('-inf'),
+                                       device=queries.device, dtype=torch.float32)
+                    for j in range(i + 1):
+                        ki = j * chunk_size
+                        kj = min(ki + chunk_size, q_len)
+                        c_k = kj - ki
+                        # Pairwise log-decay using outer product of sqrt(dest) * sqrt(src)
+                        # (uses ones instead of actual keys, matching _gen_affinity_scores)
+                        log_decay = (static_dest[:, :, qi:qj].sqrt().unsqueeze(-1)
+                                    * static_src[:, :, ki:kj].sqrt().unsqueeze(-2))  # b h c_q c_k
+                        log_decay = torch.log1p(
+                            log_decay.relu().float().clamp(max=1-1e-6).neg()
+                        )
+                        if j == i:
+                            log_decay = log_decay.tril(-1)
+                        # Affinity = prefix (accumulated to chunk boundary) + local cumsum
+                        local_cumsum = log_decay.cumsum(dim=2)  # b h c_q c_k
+                        chunk_aff = prefix[:, :, ki:kj].unsqueeze(2) + local_cumsum
+                        if j == i:
+                            chunk_aff.masked_fill_(
+                                torch.ones(c_q, c_k, dtype=torch.bool, device=keys.device).triu(1),
+                                float('-inf')
+                            )
+                        chunk_aff = chunk_aff.to(dtype=keys.dtype)
+                        # Repeat for GQA and compute attention
+                        chunk_aff = chunk_aff.repeat(1, r, 1, 1)        # b nheads c_q c_k
+                        k_chunk = keys[:, :, ki:kj, :].repeat(1, r, 1, 1)
+                        v_chunk = values[:, :, ki:kj, :].repeat(1, r, 1, 1)
+                        scores = (q_chunk @ k_chunk.transpose(-1, -2)).float() + chunk_aff.float()
+                        # Online softmax update
+                        chunk_max = scores.amax(dim=-1, keepdim=True)
+                        m_new = torch.maximum(m_acc, chunk_max)
+                        exp_scores = torch.exp(scores - m_new).nan_to_num(0.0)
+                        exp_old = torch.exp(m_acc - m_new).nan_to_num(0.0)
+                        l_acc = l_acc * exp_old + exp_scores.sum(dim=-1, keepdim=True)
+                        o_acc = o_acc * exp_old + exp_scores @ v_chunk.float()
+                        m_acc = m_new
+                        # Update prefix: accumulate decay from query chunk i to keys in chunk j
+                        prefix[:, :, ki:kj] += local_cumsum[:, :, -1, :]
+                    attn_chunks.append((o_acc / l_acc).to(queries.dtype))
+                attn = torch.cat(attn_chunks, dim=2)  # b h l d
+                # prefix now holds cumulative decay at last position for each key = cache_affs
+                affs = prefix.to(dtype=keys.dtype)
+                aux = prefix.exp().gt(.001).to(keys.dtype).mean()
             attn = attn.transpose(1,2).contiguous()  # b l h d
-
-            # c = 512
-            # b = batch_size
-            # # Right-pad k,v,src if len not divisible by chunksize
-            # if q_len % c != 0:
-            #     slack = c - q_len % c
-            #     queries = torch.cat([queries, torch.zeros(b, self.kvheads, self.nheads//self.kvheads, slack, self.emb_kq_per_head, 
-            #                                               device=queries.device, dtype=queries.dtype)], dim=-2)
-            #     keys = torch.cat([keys, torch.zeros(b, self.kvheads, slack, self.emb_kq_per_head, 
-            #                                               device=keys.device, dtype=keys.dtype)], dim=-2)
-            #     values = torch.cat([values, torch.zeros(b, self.kvheads, slack, self.emb_v_per_head, 
-            #                                               device=values.device, dtype=values.dtype)], dim=-2)
-            #     static_src = torch.cat([static_src, torch.zeros(b, self.kvheads, slack,
-            #                                                    device=static_src.device, dtype=static_src.dtype)], dim=-1)
-            #     static_dest = torch.cat([static_dest, torch.zeros(b, self.kvheads, slack,
-            #                                                    device=static_dest.device, dtype=static_dest.dtype)], dim=-1)
-
-            # # Chunk inputs
-            # l = static_src.size(2)
-            # n = l//c
-            # s = [b, self.kvheads, n, c, -1]
-            # kc = keys.view(*s)  # b h n c d
-            # vc = values.view(*s)
-            # static_src = static_src.view(b, self.kvheads, n, c)  # b h n c
-
-            # # Perform UA
-            # output, denom, affs = self.UA(kc, vc, queries, static_src, static_dest)
-
-            # # Weighted avg for final softmax
-            # output = self.SMVMM(output, denom)  # b h r l d
-            # attn = output.permute(0,3,1,2,4).reshape(b,l,-1)
-
-            # # Prune any right-padding
-            # keys = keys[:,:,:q_len]
-            # values = values[:,:,:q_len]
-            # affs = affs[:,:,:q_len]
-            # attn = attn[:,:q_len]
 
         attn = attn.view(batch_size, q_len, self.nheads * self.emb_v_per_head)
         attn = self.gate_proj(q) * attn
@@ -681,9 +700,10 @@ class MultiHeadAttention(nn.Module):
         affinity = torch.einsum('bnqh, bnkh -> bnqk', k*dest.sqrt().unsqueeze(-1), k*src.sqrt().unsqueeze(-1)).relu().float()#.pow(2/3)
         affinity = torch.log1p(affinity.clamp(min=0, max=1-1e-6).neg())
         affinity = affinity.tril(-1).cumsum(2).to(dtype=k.dtype)
-        affs = affinity[:,:,-1].exp().gt(.001).to(affinity.dtype).mean()
+        cache_affs = affinity[:,:,-1]  # b h l — accumulated decay from last position, for cache init
+        aux = cache_affs.exp().gt(.001).to(affinity.dtype).mean()
         affinity = affinity.masked_fill(torch.ones_like(affinity, dtype=torch.bool).triu(1), float('-inf'))
-        return affinity.repeat(1,r,1,1), affs
+        return affinity.repeat(1,r,1,1), cache_affs, aux
         
 
 
