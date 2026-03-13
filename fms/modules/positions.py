@@ -338,18 +338,17 @@ class RotaryEmbedding(PositionEncoder):
             self.max_seq_len_cached[dev_idx] = 0
 
         if alpha not in self.cached_freqs[dev_idx]:
-            # This avoids a graph break from computing scaled_max_seq_len if not needed
             scaled_max_seq_len = self.rope_scaling.scaled_max_seq_len(
                 max_seq_len, alpha
             )
+            # Always compute when alpha is unseen — different alphas may
+            # produce different frequency bases (e.g. YaRN, NTK).
+            freqs = self.rope_scaling.compute_scaled_freqs(device, alpha)
+            t = torch.arange(scaled_max_seq_len, device=device, dtype=freqs.dtype)
+            freqs = torch.outer(t, freqs).float()
             if scaled_max_seq_len > self.max_seq_len_cached[dev_idx]:
-                # This only runs if a particular combination of alpha
-                # and max_seq_len hasn't been seen before
-                freqs = self.rope_scaling.compute_scaled_freqs(device, alpha)
-                t = torch.arange(scaled_max_seq_len, device=device, dtype=freqs.dtype)
-                freqs = torch.outer(t, freqs).float()
                 self.max_seq_len_cached[dev_idx] = scaled_max_seq_len
-                self.cached_freqs[dev_idx][alpha] = torch.stack(
+            self.cached_freqs[dev_idx][alpha] = torch.stack(
                     [
                         torch.cos(freqs),
                         -torch.sin(freqs),
@@ -360,7 +359,7 @@ class RotaryEmbedding(PositionEncoder):
                 ).view(*freqs.size(), 2, 2)
 
         return alpha
-
+    
     def reshape_for_broadcast(self, x: torch.Tensor, cur_freqs):
         ndim = x.ndim
         assert 1 < ndim, ndim
