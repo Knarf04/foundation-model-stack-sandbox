@@ -378,9 +378,9 @@ class LLaMA(nn.Module):
 
             # if not use_cache, stick aux values into present_k_v_state
             x_in, present_key_value_state = output
-            if is_decode and hasattr(x_in, '_ua_timing'):
-                ua_timings.append(x_in._ua_timing)
-                del x_in._ua_timing
+            if is_decode and present_key_value_state is not None and len(present_key_value_state) > 5:
+                ua_timings.append(present_key_value_state[5])
+                present_key_value_state = present_key_value_state[:5]
             present_key_value_states.append(present_key_value_state)
 
         dec_out = x_in

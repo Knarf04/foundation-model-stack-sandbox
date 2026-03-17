@@ -576,7 +576,7 @@ class MultiHeadAttention(nn.Module):
             # Iterative universal attention with preallocated cache
             assert q_len == 1, "UA decoding not currently supported for more than 1 token"
 
-            (k, v, r, a, cache_occupancy) = past_key_value_state  # bhld, bhld, bhl, bhl, bh
+            (k, v, r, a, cache_occupancy) = past_key_value_state[:5]  # bhld, bhld, bhl, bhl, bh
 
             B, H, L_cap, D = k.shape
             device = k.device
@@ -802,10 +802,9 @@ class MultiHeadAttention(nn.Module):
         # if use_cache=True, we return the hidden_state as well as the kv cache
         if use_cache:
             if past_key_value_state is not None:
-                # Stash timing events on the output for _helper to aggregate
-                out._ua_timing = (t_ua_start, t_ua_end, keys.shape[2])
                 # Decoding: cache_occupancy was already updated in-place
-                return out, (keys, values, rates, affs, cache_occupancy)
+                # 6th element is timing info for _helper to aggregate
+                return out, (keys, values, rates, affs, cache_occupancy, (t_ua_start, t_ua_end, keys.shape[2]))
             else:
                 # Prefill: per-head occupancy after optional pruning
                 if _prefill_occ is not None:
