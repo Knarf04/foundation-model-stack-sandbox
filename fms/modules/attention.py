@@ -521,7 +521,7 @@ class MultiHeadAttention(nn.Module):
         k: Optional[torch.Tensor] = None,
         v: Optional[torch.Tensor] = None,
         position_ids=None,
-        past_key_value_state: Optional[Tuple[Tensor | None, Tensor | None, Tensor | None, Tensor | None]] = None,
+        past_key_value_state: Optional[Tuple[Tensor | None, Tensor | None, Tensor | None, Tensor | None, Tensor | None]] = None,
         use_cache=False,
         **attn_kwargs: Unpack[AttentionKwargs],
     ):
@@ -573,42 +573,108 @@ class MultiHeadAttention(nn.Module):
             )
 
         if past_key_value_state is not None:
-            # Iterative universal attention
+            # Iterative universal attention with preallocated cache
             assert q_len == 1, "UA decoding not currently supported for more than 1 token"
-            (k, v, r, a) = past_key_value_state  # bhld, bhld, bhl, bhl
+
+            (k, v, r, a, cache_occupancy) = past_key_value_state  # bhld, bhld, bhl, bhl, bh
+
+            B, H, L_cap, D = k.shape
+            device = k.device
+            preallocate = 64
+            thresh = math.log(self.thresh)
+
+            # --- Timing events ---
+            t_start = torch.cuda.Event(enable_timing=True)
+            t_decay = torch.cuda.Event(enable_timing=True)
+            t_evict = torch.cuda.Event(enable_timing=True)
+            t_insert = torch.cuda.Event(enable_timing=True)
+            t_attn = torch.cuda.Event(enable_timing=True)
+            t_end = torch.cuda.Event(enable_timing=True)
+
+            t_start.record()
+
             k_ = keys.squeeze(1)  # b h d
             v_ = values.squeeze(1)  # b h d
-            q_ = queries.view(batch_size, -1, self.kvheads, self.emb_kq_per_head).transpose(1, 2)  # b h r d
+            q = queries.view(batch_size, -1, self.kvheads, self.emb_kq_per_head).transpose(1, 2)  # b h r d
             static_src = static_src.squeeze(2)  # b h
             static_dest = static_dest.squeeze(2)  # b h
 
-            # Update k/v cache
-            k = torch.cat((k, k_.unsqueeze(2)), dim=2)
-            v = torch.cat((v, v_.unsqueeze(2)), dim=2)
+            positions = torch.arange(L_cap, device=device).view(1, 1, L_cap)  # (1, 1, L_cap)
+            occ = cache_occupancy.unsqueeze(-1)  # (B, H, 1)
+            occ_mask = positions < occ  # (B, H, L_cap), bool
 
-            # q/k/k products
-            qkkk = k.matmul(torch.cat([q_, k_.unsqueeze(2)], dim=2).transpose(-1,-2))  # b h l+1 r+1
-            qk = qkkk[...,:-1]  # b h l+1 r
-            kk = qkkk[:,:,:-1,-1]  # b h l
+            kk = torch.einsum("bhld,bhd->bhl", k, k_)
 
-            # Calculate decays
             decay = kk.relu().float().pow(2)
-            decay = (decay * r * static_dest.unsqueeze(-1)).pow(1/3)
-            decay = torch.log1p(decay.clamp(min=0, max=1-1e-6).neg())
+            decay = (decay * r * static_dest.unsqueeze(-1)).pow(1.0 / 3.0)
+            decay = torch.log1p(decay.clamp(min=0, max=1 - 1e-6).neg())
+
             a = a + decay
 
-            # Update r/a cache
-            r = torch.cat((r, static_src.unsqueeze(2)), dim=2)
-            a = torch.cat((a, torch.zeros(batch_size, self.kvheads, 1, device=a.device, dtype=a.dtype)), dim=2)
+            t_decay.record()
 
-            # Apply pruning
-            a_mask = a
-            if self.prune:
-                a_mask = a.masked_fill(a.lt(math.log(self.thresh)), float('-inf'))
+            a_masked = a.masked_fill(~occ_mask, float("inf"))  # ignore invalid positions
+            a_min = torch.min(a_masked, dim=-1).values  # (B, H)
+            a_min_idx = torch.min(a_masked, dim=-1).indices  # (B, H)
+            decay_mask = a_min > thresh  # (B, H) — True means no slot below threshold, append instead
 
-            # Perform scaled attention
-            attn = qk.float().add(a_mask.unsqueeze(-1)).softmax(dim=2).to(dtype=v.dtype).transpose(-1,-2).matmul(v)  # b h r d
+            idx = torch.where(decay_mask, cache_occupancy, a_min_idx)
+            cache_occupancy[decay_mask] += 1
+
+            t_evict.record()
+
+            b_idx = torch.arange(B, device=device)[:, None].expand(B, H)  # (B, H)
+            h_idx = torch.arange(H, device=device)[None, :].expand(B, H)  # (B, H)
+
+            k[b_idx, h_idx, idx, :] = k_
+            v[b_idx, h_idx, idx, :] = v_
+            r[b_idx, h_idx, idx] = static_src
+            a[b_idx, h_idx, idx] = 0.0
+
+            t_insert.record()
+
+            # Recompute occupancy mask after insertion
+            occ = cache_occupancy.unsqueeze(-1)  # (B, H, 1)
+            occ_mask = positions < occ  # (B, H, L_cap)
+            valid_mask4 = occ_mask.unsqueeze(-1)  # (B, H, L_cap, 1)
+
+            qk = torch.einsum("bhld,bhrd->bhlr", k, q)
+
+            logits = qk.float().add(a.unsqueeze(-1))  # (B, H, L_cap, R)
+            logits = logits.masked_fill(~valid_mask4, float("-inf"))
+
+            attn_weights = logits.softmax(dim=2).to(dtype=v.dtype)  # (B, H, L_cap, R)
+            attn = attn_weights.transpose(-1, -2).matmul(v)  # (B, H, R, D)
             attn = attn.transpose(1, 2).contiguous()  # b r h d
+
+            t_attn.record()
+
+            # Grow cache if any head is full
+            if (cache_occupancy == L_cap).any():
+                new_k = torch.zeros(B, H, L_cap + preallocate, k.shape[-1], device=device, dtype=k.dtype)
+                new_v = torch.zeros(B, H, L_cap + preallocate, v.shape[-1], device=device, dtype=v.dtype)
+                new_r = torch.zeros(B, H, L_cap + preallocate, device=device, dtype=r.dtype)
+                new_a = torch.zeros(B, H, L_cap + preallocate, device=device, dtype=a.dtype)
+                new_k[:, :, :L_cap, :] = k
+                new_v[:, :, :L_cap, :] = v
+                new_r[:, :, :L_cap] = r
+                new_a[:, :, :L_cap] = a
+                k, v, r, a = new_k, new_v, new_r, new_a
+
+            t_end.record()
+            torch.cuda.synchronize()
+
+            print(
+                f"[UA decode] "
+                f"decay={t_start.elapsed_time(t_decay):.3f}ms  "
+                f"evict={t_decay.elapsed_time(t_evict):.3f}ms  "
+                f"insert={t_evict.elapsed_time(t_insert):.3f}ms  "
+                f"attn={t_insert.elapsed_time(t_attn):.3f}ms  "
+                f"realloc={t_attn.elapsed_time(t_end):.3f}ms  "
+                f"total={t_start.elapsed_time(t_end):.3f}ms  "
+                f"L_cap={L_cap}"
+            )
+
             (keys, values, rates, affs) = k, v, r, a
             
         else:
@@ -674,10 +740,6 @@ class MultiHeadAttention(nn.Module):
                                 float('-inf')
                             )
                         chunk_aff = chunk_aff.to(dtype=keys.dtype)
-                        if self.prune:
-                            chunk_aff = chunk_aff.masked_fill(
-                                chunk_aff.lt(math.log(self.thresh)), float('-inf')
-                            )
                         # Repeat for GQA and compute attention
                         chunk_aff = chunk_aff.repeat(1, r, 1, 1)        # b nheads c_q c_k
                         k_chunk = keys[:, :, ki:kj, :].repeat(1, r, 1, 1)
@@ -699,6 +761,23 @@ class MultiHeadAttention(nn.Module):
                 affs = prefix.to(dtype=keys.dtype)
                 aux = prefix.exp().gt(self.thresh).to(keys.dtype).mean()
             attn = attn.transpose(1,2).contiguous()  # b l h d
+
+            # Post-attention KV cache pruning: remove entries below threshold
+            _prefill_occ = None
+            if self.prune:
+                # affs: (B, H, L) — accumulated decay from last position to each key
+                keep_mask = affs.exp().gt(self.thresh)  # (B, H, L)
+                n_kept = keep_mask.sum(dim=-1)  # (B, H)
+                max_kept = n_kept.max().item()
+                if max_kept < q_len:
+                    # Compact the cache: sort so kept entries come first, then truncate
+                    sorted_idx = keep_mask.float().argsort(dim=-1, descending=True)  # (B, H, L)
+                    sorted_idx_k = sorted_idx.unsqueeze(-1).expand_as(keys)  # (B, H, L, D)
+                    keys = keys.gather(2, sorted_idx_k)[:, :, :max_kept]
+                    values = values.gather(2, sorted_idx_k)[:, :, :max_kept]
+                    rates = rates.gather(2, sorted_idx)[:, :, :max_kept]
+                    affs = affs.gather(2, sorted_idx)[:, :, :max_kept]
+                    _prefill_occ = n_kept  # per-head occupancy (B, H)
 
             # c = 512
             # b = batch_size
@@ -743,7 +822,21 @@ class MultiHeadAttention(nn.Module):
 
         # if use_cache=True, we return the hidden_state as well as the kv cache
         if use_cache:
-            return out, (keys, values, rates, affs)
+            if past_key_value_state is not None:
+                # Decoding: cache_occupancy was already updated in-place
+                return out, (keys, values, rates, affs, cache_occupancy)
+            else:
+                # Prefill: per-head occupancy after optional pruning
+                if _prefill_occ is not None:
+                    cache_occ = _prefill_occ.to(dtype=torch.long)
+                else:
+                    cache_occ = torch.full(
+                        (keys.shape[0], keys.shape[1]),
+                        keys.shape[2],
+                        device=keys.device,
+                        dtype=torch.long,
+                    )
+                return out, (keys, values, rates, affs, cache_occ)
         else:
             return out, aux
 
@@ -755,8 +848,6 @@ class MultiHeadAttention(nn.Module):
         cache_affs = affinity[:,:,-1]  # b h l — accumulated decay from last position, for cache init
         aux = cache_affs.exp().gt(self.thresh).to(affinity.dtype).mean()
         affinity = affinity.masked_fill(torch.ones_like(affinity, dtype=torch.bool).triu(1), float('-inf'))
-        if self.prune:
-            affinity = affinity.masked_fill(affinity.lt(math.log(self.thresh)), float('-inf'))  # ACTUAL MASKING
         return affinity.repeat(1,r,1,1), cache_affs, aux
         
 
