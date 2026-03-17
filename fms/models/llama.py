@@ -351,8 +351,17 @@ class LLaMA(nn.Module):
         # x_in: batch_size x seq_len
         # mask: batch_size x seq_len x seq_len
         # bias: nheads x seq_len x seq_len
-        if past_key_value_states is None or len(past_key_value_states) == 0:
+        is_decode = past_key_value_states is not None and len(past_key_value_states) > 0
+        if not is_decode:
             past_key_value_states = [None for _ in range(len(self.layers))]
+
+        if is_decode:
+            import torch
+            t_fwd_start = torch.cuda.Event(enable_timing=True)
+            t_fwd_end = torch.cuda.Event(enable_timing=True)
+            t_fwd_start.record()
+            ua_timings = []
+
         x_in = self.shared(x_in)
 
         # this is the output cache for all the decoder layers
@@ -369,12 +378,31 @@ class LLaMA(nn.Module):
 
             # if not use_cache, stick aux values into present_k_v_state
             x_in, present_key_value_state = output
+            if is_decode and hasattr(x_in, '_ua_timing'):
+                ua_timings.append(x_in._ua_timing)
+                del x_in._ua_timing
             present_key_value_states.append(present_key_value_state)
 
         dec_out = x_in
         dec_out = self.dec_norm(dec_out)
         if self.config.p_dropout:
             dec_out = self.dropout(dec_out)
+
+        if is_decode:
+            t_fwd_end.record()
+            t_fwd_end.synchronize()
+            e2e = t_fwd_start.elapsed_time(t_fwd_end)
+            if ua_timings:
+                ua_total = sum(s.elapsed_time(e) for s, e, _ in ua_timings)
+                avg_lcap = sum(l for _, _, l in ua_timings) / len(ua_timings)
+                print(
+                    f"[model decode] e2e={e2e:.3f}ms  "
+                    f"ua_sum={ua_total:.3f}ms ({100*ua_total/e2e:.1f}%)  "
+                    f"avg_L_cap={avg_lcap:.0f}  "
+                    f"n_layers={len(ua_timings)}"
+                )
+            else:
+                print(f"[model decode] e2e={e2e:.3f}ms")
 
         return dec_out, present_key_value_states
 

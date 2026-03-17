@@ -802,12 +802,8 @@ class MultiHeadAttention(nn.Module):
         # if use_cache=True, we return the hidden_state as well as the kv cache
         if use_cache:
             if past_key_value_state is not None:
-                t_ua_end.synchronize()
-                print(
-                    f"[UA decode] "
-                    f"ua_attn={t_ua_start.elapsed_time(t_ua_end):.3f}ms  "
-                    f"L_cap={keys.shape[2]}"
-                )
+                # Stash timing events on the output for _helper to aggregate
+                out._ua_timing = (t_ua_start, t_ua_end, keys.shape[2])
                 # Decoding: cache_occupancy was already updated in-place
                 return out, (keys, values, rates, affs, cache_occupancy)
             else:
