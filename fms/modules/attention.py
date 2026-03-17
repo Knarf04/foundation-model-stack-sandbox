@@ -594,7 +594,7 @@ class MultiHeadAttention(nn.Module):
 
             k_ = keys.squeeze(1)  # b h d
             v_ = values.squeeze(1)  # b h d
-            q = queries.view(batch_size, -1, self.kvheads, self.emb_kq_per_head).transpose(1, 2)  # b h r d
+            q_ = queries.view(batch_size, -1, self.kvheads, self.emb_kq_per_head).transpose(1, 2)  # b h r d
             static_src = static_src.squeeze(2)  # b h
             static_dest = static_dest.squeeze(2)  # b h
 
@@ -652,7 +652,7 @@ class MultiHeadAttention(nn.Module):
             occ_mask = positions < occ  # (B, H, L_cap)
             valid_mask4 = occ_mask.unsqueeze(-1)  # (B, H, L_cap, 1)
 
-            qk = torch.einsum("bhld,bhrd->bhlr", k, q)
+            qk = torch.einsum("bhld,bhrd->bhlr", k, q_)
 
             logits = qk.float().add(a.unsqueeze(-1))  # (B, H, L_cap, R)
             logits = logits.masked_fill(~valid_mask4, float("-inf"))
