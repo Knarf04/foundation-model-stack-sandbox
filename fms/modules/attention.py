@@ -583,14 +583,11 @@ class MultiHeadAttention(nn.Module):
             preallocate = 64
             thresh = math.log(self.thresh)
 
-            # --- Timing events ---
-            t_start = torch.cuda.Event(enable_timing=True)
-            t_decay = torch.cuda.Event(enable_timing=True)
-            t_evict = torch.cuda.Event(enable_timing=True)
-            t_insert = torch.cuda.Event(enable_timing=True)
-            t_end = torch.cuda.Event(enable_timing=True)
+            # --- Timing: UA attention portion of decode step ---
+            t_ua_start = torch.cuda.Event(enable_timing=True)
+            t_ua_end = torch.cuda.Event(enable_timing=True)
 
-            t_start.record()
+            t_ua_start.record()
 
             k_ = keys.squeeze(1)  # b h d
             v_ = values.squeeze(1)  # b h d
@@ -610,8 +607,6 @@ class MultiHeadAttention(nn.Module):
 
             a = a + decay
 
-            t_decay.record()
-
             a_masked = a.masked_fill(~occ_mask, float("inf"))  # ignore invalid positions
             a_min = torch.min(a_masked, dim=-1).values  # (B, H)
             a_min_idx = torch.min(a_masked, dim=-1).indices  # (B, H)
@@ -619,8 +614,6 @@ class MultiHeadAttention(nn.Module):
 
             idx = torch.where(decay_mask, cache_occupancy, a_min_idx)
             cache_occupancy[decay_mask] += 1
-
-            t_evict.record()
 
             # Grow cache before insert if any idx would be out of bounds
             if (idx >= L_cap).any():
@@ -645,8 +638,6 @@ class MultiHeadAttention(nn.Module):
             r[b_idx, h_idx, idx] = static_src
             a[b_idx, h_idx, idx] = 0.0
 
-            t_insert.record()
-
             # Recompute occupancy mask after insertion
             occ = cache_occupancy.unsqueeze(-1)  # (B, H, 1)
             occ_mask = positions < occ  # (B, H, L_cap)
@@ -661,18 +652,7 @@ class MultiHeadAttention(nn.Module):
             attn = attn_weights.transpose(-1, -2).matmul(v)  # (B, H, R, D)
             attn = attn.transpose(1, 2).contiguous()  # b r h d
 
-            t_end.record()
-            torch.cuda.synchronize()
-
-            print(
-                f"[UA decode] "
-                f"decay={t_start.elapsed_time(t_decay):.3f}ms  "
-                f"evict={t_decay.elapsed_time(t_evict):.3f}ms  "
-                f"insert={t_evict.elapsed_time(t_insert):.3f}ms  "
-                f"attn={t_insert.elapsed_time(t_end):.3f}ms  "
-                f"total={t_start.elapsed_time(t_end):.3f}ms  "
-                f"L_cap={L_cap}"
-            )
+            t_ua_end.record()
 
             (keys, values, rates, affs) = k, v, r, a
             
@@ -822,6 +802,12 @@ class MultiHeadAttention(nn.Module):
         # if use_cache=True, we return the hidden_state as well as the kv cache
         if use_cache:
             if past_key_value_state is not None:
+                t_ua_end.synchronize()
+                print(
+                    f"[UA decode] "
+                    f"ua_attn={t_ua_start.elapsed_time(t_ua_end):.3f}ms  "
+                    f"L_cap={keys.shape[2]}"
+                )
                 # Decoding: cache_occupancy was already updated in-place
                 return out, (keys, values, rates, affs, cache_occupancy)
             else:
