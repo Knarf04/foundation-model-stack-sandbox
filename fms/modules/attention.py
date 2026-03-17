@@ -588,7 +588,6 @@ class MultiHeadAttention(nn.Module):
             t_decay = torch.cuda.Event(enable_timing=True)
             t_evict = torch.cuda.Event(enable_timing=True)
             t_insert = torch.cuda.Event(enable_timing=True)
-            t_attn = torch.cuda.Event(enable_timing=True)
             t_end = torch.cuda.Event(enable_timing=True)
 
             t_start.record()
@@ -623,6 +622,21 @@ class MultiHeadAttention(nn.Module):
 
             t_evict.record()
 
+            # Grow cache before insert if any idx would be out of bounds
+            if (idx >= L_cap).any():
+                new_L = L_cap + preallocate
+                new_k = torch.zeros(B, H, new_L, k.shape[-1], device=device, dtype=k.dtype)
+                new_v = torch.zeros(B, H, new_L, v.shape[-1], device=device, dtype=v.dtype)
+                new_r = torch.zeros(B, H, new_L, device=device, dtype=r.dtype)
+                new_a = torch.zeros(B, H, new_L, device=device, dtype=a.dtype)
+                new_k[:, :, :L_cap, :] = k
+                new_v[:, :, :L_cap, :] = v
+                new_r[:, :, :L_cap] = r
+                new_a[:, :, :L_cap] = a
+                k, v, r, a = new_k, new_v, new_r, new_a
+                L_cap = new_L
+                positions = torch.arange(L_cap, device=device).view(1, 1, L_cap)
+
             b_idx = torch.arange(B, device=device)[:, None].expand(B, H)  # (B, H)
             h_idx = torch.arange(H, device=device)[None, :].expand(B, H)  # (B, H)
 
@@ -647,20 +661,6 @@ class MultiHeadAttention(nn.Module):
             attn = attn_weights.transpose(-1, -2).matmul(v)  # (B, H, R, D)
             attn = attn.transpose(1, 2).contiguous()  # b r h d
 
-            t_attn.record()
-
-            # Grow cache if any head is full
-            if (cache_occupancy == L_cap).any():
-                new_k = torch.zeros(B, H, L_cap + preallocate, k.shape[-1], device=device, dtype=k.dtype)
-                new_v = torch.zeros(B, H, L_cap + preallocate, v.shape[-1], device=device, dtype=v.dtype)
-                new_r = torch.zeros(B, H, L_cap + preallocate, device=device, dtype=r.dtype)
-                new_a = torch.zeros(B, H, L_cap + preallocate, device=device, dtype=a.dtype)
-                new_k[:, :, :L_cap, :] = k
-                new_v[:, :, :L_cap, :] = v
-                new_r[:, :, :L_cap] = r
-                new_a[:, :, :L_cap] = a
-                k, v, r, a = new_k, new_v, new_r, new_a
-
             t_end.record()
             torch.cuda.synchronize()
 
@@ -669,8 +669,7 @@ class MultiHeadAttention(nn.Module):
                 f"decay={t_start.elapsed_time(t_decay):.3f}ms  "
                 f"evict={t_decay.elapsed_time(t_evict):.3f}ms  "
                 f"insert={t_evict.elapsed_time(t_insert):.3f}ms  "
-                f"attn={t_insert.elapsed_time(t_attn):.3f}ms  "
-                f"realloc={t_attn.elapsed_time(t_end):.3f}ms  "
+                f"attn={t_insert.elapsed_time(t_end):.3f}ms  "
                 f"total={t_start.elapsed_time(t_end):.3f}ms  "
                 f"L_cap={L_cap}"
             )
