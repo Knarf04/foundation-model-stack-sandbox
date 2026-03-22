@@ -59,6 +59,14 @@ class LLaMAConfig(ModelConfig):
     rope_partial: float = 1.0
     linear_config: Optional[Mapping[str, Any]] = None
     fused_weights: bool = True
+    # KV cache eviction config (inference only, set to None to disable)
+    kv_eviction: Optional[str] = None  # "h2o", "snapkv", "pyramid_h2o", "pyramid_snapkv"
+    kv_eviction_heavy_ratio: float = 0.25
+    kv_eviction_recent_ratio: float = 0.25
+    kv_eviction_window_size: int = 64
+    kv_eviction_sparsity_ratio: float = 0.25
+    kv_eviction_kernel_size: int = 5
+    kv_eviction_pooling: str = "avgpool"
 
 
 class LLaMABlock(nn.Module):
@@ -244,6 +252,29 @@ class LLaMA(nn.Module):
         if self.config.p_dropout:
             self.dropout = nn.Dropout(self.config.p_dropout)
 
+        # Initialize MiniKV eviction if configured
+        self._minikv_kwargs = None
+        logger.info(f"[LLaMA __init__] kv_eviction={self.config.kv_eviction}")
+        if self.config.kv_eviction is not None:
+            from fms.utils.minikv.attention_op import MiniKVConfig, create_minikv_kwargs
+
+            minikv_config = MiniKVConfig(
+                selection_method=self.config.kv_eviction,
+                heavy_ratio=self.config.kv_eviction_heavy_ratio,
+                recent_ratio=self.config.kv_eviction_recent_ratio,
+                window_size=self.config.kv_eviction_window_size,
+                prompt_sparsity_ratio=self.config.kv_eviction_sparsity_ratio,
+                kernel_size=self.config.kv_eviction_kernel_size,
+                pooling=self.config.kv_eviction_pooling,
+            )
+            self._minikv_kwargs = create_minikv_kwargs(
+                minikv_config, num_layers=self.config.nlayers
+            )
+            logger.info(f"[LLaMA __init__] MiniKV initialized: method={self.config.kv_eviction}, "
+                       f"_minikv_kwargs keys={list(self._minikv_kwargs.keys())}")
+        else:
+            logger.debug(f"[LLaMA __init__] No KV eviction configured")
+
     def get_config(self) -> LLaMAConfig:
         return self.config
 
@@ -342,10 +373,24 @@ class LLaMA(nn.Module):
         use_cache=False,
         **attn_kwargs: Unpack[AttentionKwargs],
     ):
-        # Embed the given vocabulary indices using the given attention mask, with pre-/post-norm and dropout as specified
-        # x_in: batch_size x seq_len
-        # mask: batch_size x seq_len x seq_len
-        # bias: nheads x seq_len x seq_len
+        # Auto-inject MiniKV kwargs if kv_eviction is configured
+        if self._minikv_kwargs is not None and "attn_name" not in attn_kwargs:
+            state = self._minikv_kwargs["minikv_state"]
+            state["layer_counter"] = 0
+            state["is_prefill"] = (
+                past_key_value_states is None or len(past_key_value_states) == 0
+            )
+            attn_kwargs.update(self._minikv_kwargs)
+            if state["is_prefill"]:
+                # Keep mask for prefill (padding support for batched sequences).
+                # compute_prefill_op integrates it into the causal mask.
+                logger.info(f"[MiniKV] PREFILL seq_len={x_in.shape[1]}, method={state['config'].selection_method}")
+            else:
+                # Drop mask for decode: after eviction the cache has S_evicted tokens
+                # but the original mask was sized for S_prefill, so dimensions don't match.
+                # Single-token decode against the full cache doesn't need masking.
+                attn_kwargs.pop("mask", None)
+
         if past_key_value_states is None or len(past_key_value_states) == 0:
             past_key_value_states = [None for _ in range(len(self.layers))]
         x_in = self.shared(x_in)
@@ -368,6 +413,25 @@ class LLaMA(nn.Module):
 
             else:
                 x_in = output
+
+        # Log per-layer and average cache sizes after each forward pass
+        if (
+            self._minikv_kwargs is not None
+            and use_cache
+            and present_key_value_states
+        ):
+            from fms.utils.minikv.cache import EvictedKVCache
+            sizes = []
+            for layer_cache in present_key_value_states:
+                kv = layer_cache[0]
+                if isinstance(kv, EvictedKVCache) and kv.keys is not None:
+                    sizes.append(kv.keys.shape[2])
+            if sizes:
+                avg = sum(sizes) / len(sizes)
+                logical = present_key_value_states[0][0].seq_len_logical
+                mn, mx = min(sizes), max(sizes)
+                logger.info(f"[MiniKV] logical={logical}, avg_physical={avg:.0f}, "
+                           f"min={mn}, max={mx}, kept={avg/logical*100:.1f}%")
 
         dec_out = x_in
         dec_out = self.dec_norm(dec_out)
