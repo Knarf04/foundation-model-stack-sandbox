@@ -220,7 +220,10 @@ def _minikv_compute_prefill_op(
     attn_output = torch.matmul(attn_weights, values_e)  # (B, nheads, S, D)
 
     # 3. Aggregate attention scores nheads → kvheads for eviction
-    cumulative_attn_map = attn_weights.sum(2)  # (B, nheads, S)
+    # Use nansum to handle left-padded batches: padding queries where all keys
+    # are masked produce NaN after softmax. Regular sum would propagate NaN to
+    # all cumulative scores, breaking H2O token selection.
+    cumulative_attn_map = torch.nansum(attn_weights, dim=2)  # (B, nheads, S)
     if expansion != 1:
         cumulative_attn_map_kv = cumulative_attn_map.view(
             B, kvheads, expansion, S
