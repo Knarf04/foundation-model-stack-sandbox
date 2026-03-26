@@ -136,7 +136,7 @@ class UnRopeScalingImpl(RopeNoScalingImpl):
         dim = self.dim
 
         logstart = math.log(2*math.pi / ratio)  # 1 cycle in ratio steps
-        logend = math.log(4*math.pi / self.orig_max_seq_len)  # 2 cycles in 4k steps
+        logend = math.log(4*math.pi / 4096)  # 2 cycles in 4k steps
         pos = torch.arange(0, dim//2, device=device) / (dim//2-1)
         logfreq = pos*(logend-logstart) + logstart
         freqs = logfreq.exp()
@@ -206,11 +206,79 @@ class RopeLlama3ScalingImpl(RopeNoScalingImpl):
         freqs = torch.where(is_medium_freq, smoothed_freqs, freqs_llama)
         return freqs
 
+class RopeYaRNScalingImpl(RopeNoScalingImpl):
+    # scaling_info keys:
+    #   factor  (required) – context-length multiplier, e.g. 2.0 for 4k→8k
+    #   beta_fast          – upper ramp boundary (default 32)
+    #   beta_slow          – lower ramp boundary (default 1)
+    #   original_max_position_embeddings – original training length (defaults
+    #                                      to self.orig_max_seq_len)
 
+    def _yarn_find_correction_dim(self, num_rotations: float) -> float:
+        """Dimension index at which a rotation count `num_rotations` occurs
+        within the original context window."""
+        return (
+            self.dim
+            * math.log(
+                self.orig_max_seq_len / (num_rotations * 2 * math.pi)
+            )
+            / (2 * math.log(self.ratio))
+        )
+
+    def _yarn_find_correction_range(self, beta_slow: float, beta_fast: float):
+        low = math.floor(self._yarn_find_correction_dim(beta_slow))
+        high = math.ceil(self._yarn_find_correction_dim(beta_fast))
+        return max(low, 0), min(high, self.dim // 2 - 1)
+
+    @staticmethod
+    def _yarn_linear_ramp(min_val: float, max_val: float, n: int) -> torch.Tensor:
+        if min_val == max_val:
+            max_val += 0.001
+        t = torch.arange(n, dtype=torch.float32)
+        return ((t - min_val) / (max_val - min_val)).clamp(0, 1)
+
+    def get_alpha(self, current_max_seq_len: int) -> int:
+        # Dynamic: derive factor from actual vs original context length.
+        # alpha is used as a cache bucket key — all seq lens within the same
+        # alpha bucket share the same freqs (factor = alpha).
+        alpha = math.ceil(current_max_seq_len / self.orig_max_seq_len)
+        alpha = max(alpha, 1)
+        return alpha
+
+    def scaled_max_seq_len(self, current_max_seq_len: int, alpha: int):
+        return max(current_max_seq_len, self.orig_max_seq_len * alpha)
+
+    def compute_scaled_freqs(self, device: str, alpha: int):
+        # factor = alpha, the integer ceiling of seq_len / orig_seq_len.
+        # This keeps freqs stable within a bucket (e.g. alpha=2 → factor=2
+        # for all seq lens in (4096, 8192]).
+        factor = float(alpha)
+        beta_fast = self.scaling_info.get("beta_fast", 35)
+        beta_slow = self.scaling_info.get("beta_slow", 0.7)
+
+        # Base (extrapolation) frequencies – same as unscaled RoPE
+        freqs_original = 1.0 / (
+            self.ratio
+            ** (
+                torch.arange(0, self.dim, 2, device=device)[: (self.dim // 2)].float()
+                / self.dim
+            )
+        )
+        # Interpolated frequencies (linear scaling)
+        freqs_interpolated = freqs_original / factor
+
+        # Ramp: 0 → use interpolated, 1 → use original
+        low, high = self._yarn_find_correction_range(beta_slow, beta_fast)
+        ramp = self._yarn_linear_ramp(low, high, self.dim // 2).to(device)
+
+        freqs = freqs_interpolated * (1 - ramp) + freqs_original * ramp
+        return freqs
+    
 _rope_scale_mapping = {
     "llama3": RopeLlama3ScalingImpl,
     "ntk": RopeNtkScalingImpl,
     "regular": RopeNoScalingImpl,
+    "yarn": RopeYaRNScalingImpl,
     "unrope": UnRopeScalingImpl,
 }
 
@@ -270,18 +338,17 @@ class RotaryEmbedding(PositionEncoder):
             self.max_seq_len_cached[dev_idx] = 0
 
         if alpha not in self.cached_freqs[dev_idx]:
-            # This avoids a graph break from computing scaled_max_seq_len if not needed
             scaled_max_seq_len = self.rope_scaling.scaled_max_seq_len(
                 max_seq_len, alpha
             )
+            # Always compute when alpha is unseen — different alphas may
+            # produce different frequency bases (e.g. YaRN, NTK).
+            freqs = self.rope_scaling.compute_scaled_freqs(device, alpha)
+            t = torch.arange(scaled_max_seq_len, device=device, dtype=freqs.dtype)
+            freqs = torch.outer(t, freqs).float()
             if scaled_max_seq_len > self.max_seq_len_cached[dev_idx]:
-                # This only runs if a particular combination of alpha
-                # and max_seq_len hasn't been seen before
-                freqs = self.rope_scaling.compute_scaled_freqs(device, alpha)
-                t = torch.arange(scaled_max_seq_len, device=device, dtype=freqs.dtype)
-                freqs = torch.outer(t, freqs).float()
                 self.max_seq_len_cached[dev_idx] = scaled_max_seq_len
-                self.cached_freqs[dev_idx][alpha] = torch.stack(
+            self.cached_freqs[dev_idx][alpha] = torch.stack(
                     [
                         torch.cos(freqs),
                         -torch.sin(freqs),
@@ -292,7 +359,7 @@ class RotaryEmbedding(PositionEncoder):
                 ).view(*freqs.size(), 2, 2)
 
         return alpha
-
+    
     def reshape_for_broadcast(self, x: torch.Tensor, cur_freqs):
         ndim = x.ndim
         assert 1 < ndim, ndim
