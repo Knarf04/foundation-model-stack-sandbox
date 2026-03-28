@@ -1,4 +1,5 @@
 import abc
+import atexit
 import functools
 import math
 import os
@@ -435,6 +436,19 @@ class MultiHeadAttention(nn.Module):
         linear_config.
     """
 
+    _prune_log_path = os.environ.get("PRUNE_LOG_PATH", None)
+    _prune_accum = []
+    _prune_registered = False
+
+    @classmethod
+    def _flush_prune_stats(cls):
+        if cls._prune_log_path and cls._prune_accum:
+            avg_p = sum(p for p, _ in cls._prune_accum) / len(cls._prune_accum)
+            avg_k = sum(k for _, k in cls._prune_accum) / len(cls._prune_accum)
+            with open(cls._prune_log_path, 'a') as f:
+                f.write(f"{avg_p:.2f},{avg_k:.2f}\n")
+            cls._prune_accum.clear()
+
     def __init__(
         self,
         emb_dim,
@@ -465,6 +479,10 @@ class MultiHeadAttention(nn.Module):
         
         self.thresh = prune_thresh
         self.prune = prune
+
+        if MultiHeadAttention._prune_log_path and not MultiHeadAttention._prune_registered:
+            atexit.register(MultiHeadAttention._flush_prune_stats)
+            MultiHeadAttention._prune_registered = True
 
         self.in_proj: QKV = (FusedQKV if self.fused else UnfusedQKV)(
             self.emb_dim,
@@ -604,7 +622,12 @@ class MultiHeadAttention(nn.Module):
             # Apply pruning
             a_mask = a
             if self.prune:
-                a_mask = a.masked_fill(a.lt(math.log(self.thresh)), float('-inf'))
+                prune_mask = a.lt(math.log(self.thresh))
+                a_mask = a.masked_fill(prune_mask, float('-inf'))
+                if MultiHeadAttention._prune_log_path:
+                    kv_len = prune_mask.shape[-1]
+                    avg_pruned = prune_mask.sum(-1).float().mean().item()
+                    MultiHeadAttention._prune_accum.append((avg_pruned, kv_len - avg_pruned))
 
             # Perform scaled attention
             attn = qk.float().add(a_mask.unsqueeze(-1)).softmax(dim=2).to(dtype=v.dtype).transpose(-1,-2).matmul(v)  # b h r d
@@ -612,6 +635,10 @@ class MultiHeadAttention(nn.Module):
             (keys, values, rates, affs) = k, v, r, a
             
         else:
+            # Flush previous sequence's prune stats on new prefill
+            if MultiHeadAttention._prune_log_path:
+                MultiHeadAttention._flush_prune_stats()
+
             # Blockwise universal attention
             queries = queries.transpose(1,2)   # b hr l d
             keys = keys.transpose(1,2)  # b h l d
