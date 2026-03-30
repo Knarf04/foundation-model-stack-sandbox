@@ -440,6 +440,7 @@ class MultiHeadAttention(nn.Module):
     _prune_accum = []
     _prune_log_prefill_path = os.environ.get("PRUNE_LOG_PREFILL_PATH", None)
     _prune_prefill_accum = []
+    _prune_prefill_nlayers = 0
     _prune_registered = False
 
     @classmethod
@@ -491,11 +492,12 @@ class MultiHeadAttention(nn.Module):
         self.thresh = prune_thresh
         self.prune = prune
 
+        if self.prune and MultiHeadAttention._prune_log_prefill_path:
+            MultiHeadAttention._prune_prefill_nlayers += 1
+
         if not MultiHeadAttention._prune_registered:
             if MultiHeadAttention._prune_log_path:
                 atexit.register(MultiHeadAttention._flush_prune_stats)
-            if MultiHeadAttention._prune_log_prefill_path:
-                atexit.register(MultiHeadAttention._flush_prune_prefill_stats)
             MultiHeadAttention._prune_registered = True
 
         self.in_proj: QKV = (FusedQKV if self.fused else UnfusedQKV)(
@@ -652,9 +654,6 @@ class MultiHeadAttention(nn.Module):
             # Flush previous sequence's prune stats on new prefill
             if MultiHeadAttention._prune_log_path:
                 MultiHeadAttention._flush_prune_stats()
-            if MultiHeadAttention._prune_log_prefill_path:
-                MultiHeadAttention._flush_prune_prefill_stats()
-
             # Blockwise universal attention
             queries = queries.transpose(1,2)   # b hr l d
             keys = keys.transpose(1,2)  # b h l d
@@ -671,6 +670,8 @@ class MultiHeadAttention(nn.Module):
                     _pm = affs.lt(math.log(self.thresh))
                     _avg_p = _pm.sum(-1).float().mean().item()
                     MultiHeadAttention._prune_prefill_accum.append((_avg_p, q_len - _avg_p))
+                    if len(MultiHeadAttention._prune_prefill_accum) >= MultiHeadAttention._prune_prefill_nlayers:
+                        MultiHeadAttention._flush_prune_prefill_stats()
                 torch.backends.cuda.enable_math_sdp(False)
                 attn = F.scaled_dot_product_attention(
                     queries, keys.repeat(1,r,1,1), values.repeat(1,r,1,1),
@@ -749,6 +750,8 @@ class MultiHeadAttention(nn.Module):
                     _pm = affs.lt(math.log(self.thresh))
                     _avg_p = _pm.sum(-1).float().mean().item()
                     MultiHeadAttention._prune_prefill_accum.append((_avg_p, q_len - _avg_p))
+                    if len(MultiHeadAttention._prune_prefill_accum) >= MultiHeadAttention._prune_prefill_nlayers:
+                        MultiHeadAttention._flush_prune_prefill_stats()
             attn = attn.transpose(1,2).contiguous()  # b l h d
 
             # c = 512
