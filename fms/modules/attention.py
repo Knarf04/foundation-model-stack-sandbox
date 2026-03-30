@@ -436,28 +436,28 @@ class MultiHeadAttention(nn.Module):
         linear_config.
     """
 
-    _prune_log_path = os.environ.get("PRUNE_LOG_PATH", None)
     _prune_accum = []
-    _prune_log_prefill_path = os.environ.get("PRUNE_LOG_PREFILL_PATH", None)
     _prune_prefill_accum = []
     _prune_prefill_nlayers = 0
     _prune_registered = False
 
     @classmethod
     def _flush_prune_stats(cls):
-        if cls._prune_log_path and cls._prune_accum:
+        path = os.environ.get("PRUNE_LOG_PATH")
+        if path and cls._prune_accum:
             avg_p = sum(p for p, _ in cls._prune_accum) / len(cls._prune_accum)
             avg_k = sum(k for _, k in cls._prune_accum) / len(cls._prune_accum)
-            with open(cls._prune_log_path, 'a') as f:
+            with open(path, 'a') as f:
                 f.write(f"{avg_p:.2f},{avg_k:.2f}\n")
             cls._prune_accum.clear()
 
     @classmethod
     def _flush_prune_prefill_stats(cls):
-        if cls._prune_log_prefill_path and cls._prune_prefill_accum:
+        path = os.environ.get("PRUNE_LOG_PREFILL_PATH")
+        if path and cls._prune_prefill_accum:
             avg_p = sum(p for p, _ in cls._prune_prefill_accum) / len(cls._prune_prefill_accum)
             avg_k = sum(k for _, k in cls._prune_prefill_accum) / len(cls._prune_prefill_accum)
-            with open(cls._prune_log_prefill_path, 'a') as f:
+            with open(path, 'a') as f:
                 f.write(f"{avg_p:.2f},{avg_k:.2f}\n")
             cls._prune_prefill_accum.clear()
 
@@ -492,11 +492,11 @@ class MultiHeadAttention(nn.Module):
         self.thresh = prune_thresh
         self.prune = prune
 
-        if self.prune and MultiHeadAttention._prune_log_prefill_path:
+        if self.prune and os.environ.get("PRUNE_LOG_PREFILL_PATH"):
             MultiHeadAttention._prune_prefill_nlayers += 1
 
         if not MultiHeadAttention._prune_registered:
-            if MultiHeadAttention._prune_log_path:
+            if os.environ.get("PRUNE_LOG_PATH"):
                 atexit.register(MultiHeadAttention._flush_prune_stats)
             MultiHeadAttention._prune_registered = True
 
@@ -640,7 +640,7 @@ class MultiHeadAttention(nn.Module):
             if self.prune:
                 prune_mask = a.lt(math.log(self.thresh))
                 a_mask = a.masked_fill(prune_mask, float('-inf'))
-                if MultiHeadAttention._prune_log_path:
+                if os.environ.get("PRUNE_LOG_PATH"):
                     kv_len = prune_mask.shape[-1]
                     avg_pruned = prune_mask.sum(-1).float().mean().item()
                     MultiHeadAttention._prune_accum.append((avg_pruned, kv_len - avg_pruned))
@@ -652,7 +652,7 @@ class MultiHeadAttention(nn.Module):
             
         else:
             # Flush previous sequence's prune stats on new prefill
-            if MultiHeadAttention._prune_log_path:
+            if os.environ.get("PRUNE_LOG_PATH"):
                 MultiHeadAttention._flush_prune_stats()
             # Blockwise universal attention
             queries = queries.transpose(1,2)   # b hr l d
@@ -666,7 +666,7 @@ class MultiHeadAttention(nn.Module):
 
             if q_len <= chunk_size:
                 mask, affs, aux = self._gen_affinity_scores(keys, static_src, static_dest, r)
-                if MultiHeadAttention._prune_log_prefill_path and self.prune:
+                if os.environ.get("PRUNE_LOG_PREFILL_PATH") and self.prune:
                     _pm = affs.lt(math.log(self.thresh))
                     _avg_p = _pm.sum(-1).float().mean().item()
                     MultiHeadAttention._prune_prefill_accum.append((_avg_p, q_len - _avg_p))
@@ -746,7 +746,7 @@ class MultiHeadAttention(nn.Module):
                 # prefix now holds cumulative decay at last position for each key = cache_affs
                 affs = prefix.to(dtype=keys.dtype)
                 aux = prefix.exp().gt(self.thresh).to(keys.dtype).mean()
-                if MultiHeadAttention._prune_log_prefill_path and self.prune:
+                if os.environ.get("PRUNE_LOG_PREFILL_PATH") and self.prune:
                     _pm = affs.lt(math.log(self.thresh))
                     _avg_p = _pm.sum(-1).float().mean().item()
                     MultiHeadAttention._prune_prefill_accum.append((_avg_p, q_len - _avg_p))
