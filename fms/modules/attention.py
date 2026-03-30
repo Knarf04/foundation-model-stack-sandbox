@@ -438,6 +438,8 @@ class MultiHeadAttention(nn.Module):
 
     _prune_log_path = os.environ.get("PRUNE_LOG_PATH", None)
     _prune_accum = []
+    _prune_log_prefill_path = os.environ.get("PRUNE_LOG_PREFILL_PATH", None)
+    _prune_prefill_accum = []
     _prune_registered = False
 
     @classmethod
@@ -448,6 +450,15 @@ class MultiHeadAttention(nn.Module):
             with open(cls._prune_log_path, 'a') as f:
                 f.write(f"{avg_p:.2f},{avg_k:.2f}\n")
             cls._prune_accum.clear()
+
+    @classmethod
+    def _flush_prune_prefill_stats(cls):
+        if cls._prune_log_prefill_path and cls._prune_prefill_accum:
+            avg_p = sum(p for p, _ in cls._prune_prefill_accum) / len(cls._prune_prefill_accum)
+            avg_k = sum(k for _, k in cls._prune_prefill_accum) / len(cls._prune_prefill_accum)
+            with open(cls._prune_log_prefill_path, 'a') as f:
+                f.write(f"{avg_p:.2f},{avg_k:.2f}\n")
+            cls._prune_prefill_accum.clear()
 
     def __init__(
         self,
@@ -480,8 +491,11 @@ class MultiHeadAttention(nn.Module):
         self.thresh = prune_thresh
         self.prune = prune
 
-        if MultiHeadAttention._prune_log_path and not MultiHeadAttention._prune_registered:
-            atexit.register(MultiHeadAttention._flush_prune_stats)
+        if not MultiHeadAttention._prune_registered:
+            if MultiHeadAttention._prune_log_path:
+                atexit.register(MultiHeadAttention._flush_prune_stats)
+            if MultiHeadAttention._prune_log_prefill_path:
+                atexit.register(MultiHeadAttention._flush_prune_prefill_stats)
             MultiHeadAttention._prune_registered = True
 
         self.in_proj: QKV = (FusedQKV if self.fused else UnfusedQKV)(
@@ -638,6 +652,8 @@ class MultiHeadAttention(nn.Module):
             # Flush previous sequence's prune stats on new prefill
             if MultiHeadAttention._prune_log_path:
                 MultiHeadAttention._flush_prune_stats()
+            if MultiHeadAttention._prune_log_prefill_path:
+                MultiHeadAttention._flush_prune_prefill_stats()
 
             # Blockwise universal attention
             queries = queries.transpose(1,2)   # b hr l d
@@ -651,6 +667,10 @@ class MultiHeadAttention(nn.Module):
 
             if q_len <= chunk_size:
                 mask, affs, aux = self._gen_affinity_scores(keys, static_src, static_dest, r)
+                if MultiHeadAttention._prune_log_prefill_path and self.prune:
+                    _pm = affs.lt(math.log(self.thresh))
+                    _avg_p = _pm.sum(-1).float().mean().item()
+                    MultiHeadAttention._prune_prefill_accum.append((_avg_p, q_len - _avg_p))
                 torch.backends.cuda.enable_math_sdp(False)
                 attn = F.scaled_dot_product_attention(
                     queries, keys.repeat(1,r,1,1), values.repeat(1,r,1,1),
@@ -725,6 +745,10 @@ class MultiHeadAttention(nn.Module):
                 # prefix now holds cumulative decay at last position for each key = cache_affs
                 affs = prefix.to(dtype=keys.dtype)
                 aux = prefix.exp().gt(self.thresh).to(keys.dtype).mean()
+                if MultiHeadAttention._prune_log_prefill_path and self.prune:
+                    _pm = affs.lt(math.log(self.thresh))
+                    _avg_p = _pm.sum(-1).float().mean().item()
+                    MultiHeadAttention._prune_prefill_accum.append((_avg_p, q_len - _avg_p))
             attn = attn.transpose(1,2).contiguous()  # b l h d
 
             # c = 512
