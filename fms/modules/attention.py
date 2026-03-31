@@ -495,9 +495,8 @@ class MultiHeadAttention(nn.Module):
         if self.prune and os.environ.get("PRUNE_LOG_PREFILL_PATH"):
             MultiHeadAttention._prune_prefill_nlayers += 1
 
-        if not MultiHeadAttention._prune_registered:
-            if os.environ.get("PRUNE_LOG_PATH"):
-                atexit.register(MultiHeadAttention._flush_prune_stats)
+        if not MultiHeadAttention._prune_registered and os.environ.get("PRUNE_LOG_PATH"):
+            atexit.register(MultiHeadAttention._flush_prune_stats)
             MultiHeadAttention._prune_registered = True
 
         self.in_proj: QKV = (FusedQKV if self.fused else UnfusedQKV)(
