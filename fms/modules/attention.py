@@ -39,6 +39,22 @@ __sdpa_previous_math: bool = torch.backends.cuda.math_sdp_enabled()
 __type_factory_map: dict[str, dict[str, Callable]] = {}
 
 
+def _make_sliding_window_causal_mask(
+    q_len: int,
+    k_len: int,
+    window_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build a (q_len, k_len) bool mask for causal sliding-window attention.
+
+    True = attend, False = masked. Query at cache-offset position `k_len - q_len + i`
+    attends to keys in the half-open range (q_pos - window_size, q_pos].
+    """
+    q_idx = torch.arange(k_len - q_len, k_len, device=device).unsqueeze(1)
+    k_idx = torch.arange(k_len, device=device).unsqueeze(0)
+    return (k_idx <= q_idx) & (k_idx > q_idx - window_size)
+
+
 class AttentionKwargs(TypedDict, total=False):
     """
     The attention kwargs to be passed to fms model forward.
@@ -545,6 +561,9 @@ class MultiHeadAttention(nn.Module):
         (e.g., "torch_linear", "gptq", ...) or a callable for module selection depending
         on module name. Additional config options should be provided as kwargs in
         linear_config.
+    sliding_window : int
+        Causal sliding-window attention size: each query attends to at most
+        `sliding_window` most-recent keys. Defaults to 512.
     """
 
     def __init__(
@@ -560,6 +579,7 @@ class MultiHeadAttention(nn.Module):
         fused: bool = True,
         linear_config: Optional[Mapping[str, Any]] = None,
         scale_factor: Optional[float] = None,
+        sliding_window: int = 512,
     ):
         super(MultiHeadAttention, self).__init__()
         self.nheads = nheads
@@ -572,6 +592,7 @@ class MultiHeadAttention(nn.Module):
         self.fused = fused
         self.linear_config = linear_config
         self.scale_factor = scale_factor
+        self.sliding_window = sliding_window
 
         self.in_proj: QKV = (FusedQKV if self.fused else UnfusedQKV)(
             self.emb_dim,
@@ -580,6 +601,13 @@ class MultiHeadAttention(nn.Module):
             self.emb_kq_per_head,
             self.emb_v_per_head,
             self.use_bias,
+            linear_config=linear_config,
+        )
+
+        self.gate_proj = get_linear(
+            self.emb_dim,
+            self.nheads * self.emb_v_per_head,
+            bias=False,
             linear_config=linear_config,
         )
 
@@ -593,6 +621,18 @@ class MultiHeadAttention(nn.Module):
         if self.p_dropout:
             self.attn_dropout = nn.Dropout(self.p_dropout)
         self.position_encoder = position_encoder
+
+        # Local absolute-position counter for RoPE under trimmed SWA cache.
+        # Plain Python int (not a buffer) so DDP does not try to broadcast it.
+        # Only consistent for batch_size=1, single-stream generation; caller must
+        # invoke reset_position_counter() before each new prompt.
+        self.curr_id = 0
+
+    def reset_position_counter(self):
+        """Reset the local absolute-position counter. Call before each new
+        single-stream generation. A top-level model wrapper can walk modules and
+        invoke this on every MultiHeadAttention submodule."""
+        self.curr_id = 0
 
     def reset_parameters(self):
         for m in self.modules():
@@ -650,6 +690,32 @@ class MultiHeadAttention(nn.Module):
         keys = k_out.view(batch_size, q_len, self.kvheads, self.emb_kq_per_head)
         values = v_out.view(batch_size, q_len, self.kvheads, self.emb_v_per_head)
 
+        # Sliding-window KV cache trimming invalidates implicit cache-length position
+        # derivation in RoPE. Fall back to a local absolute-position counter when no
+        # position_ids is given. Restricted to batch_size=1 single-stream generation.
+        if self.position_encoder is not None and use_cache:
+            if position_ids is None:
+                if batch_size != 1:
+                    raise ValueError(
+                        "Local RoPE position counter only supports batch_size=1. "
+                        "Pass explicit absolute position_ids for batched generation."
+                    )
+                position_ids = torch.arange(
+                    self.curr_id,
+                    self.curr_id + q_len,
+                    device=q.device,
+                    dtype=torch.long,
+                ).unsqueeze(0)
+                self.curr_id += q_len
+            else:
+                # Keep local counter synchronized when caller provides positions.
+                # Local-counter path is single-stream only.
+                if position_ids.shape[0] != 1:
+                    raise ValueError(
+                        "Local RoPE position counter only supports batch_size=1."
+                    )
+                self.curr_id = int(position_ids[0, -1].item()) + 1
+
         # You want to apply rotary embeddings pre-cache
         if self.position_encoder is not None:
             queries, keys = self.position_encoder.adjusted_qk(
@@ -673,6 +739,25 @@ class MultiHeadAttention(nn.Module):
             )
         else:
             keys_compute, values_compute = keys, values
+
+        # keys_compute is either (b, kvheads, k_len, ds) after store-op transpose,
+        # or (b, k_len, kvheads, ds) when no cache was used (raw view).
+        if keys_compute.shape[1] == self.kvheads:
+            k_len = keys_compute.shape[2]
+        else:
+            k_len = keys_compute.shape[1]
+        sw_mask = _make_sliding_window_causal_mask(
+            q_len, k_len, self.sliding_window, q.device
+        )
+        existing = attn_kwargs.get("mask", None)
+        if existing is None:
+            attn_kwargs["mask"] = sw_mask
+        elif existing.dtype == torch.bool:
+            attn_kwargs["mask"] = existing & sw_mask
+        else:
+            attn_kwargs["mask"] = existing.masked_fill(~sw_mask, float("-inf"))
+        # SWA mask already encodes causality; prevent SDPA from also applying is_causal.
+        attn_kwargs["is_causal_mask"] = False
 
         if attn_compute_dict["is_prefill"](**attn_kwargs):
             attn = attn_compute_dict["compute_prefill"](
@@ -698,10 +783,19 @@ class MultiHeadAttention(nn.Module):
             )
 
         attn = attn.view(batch_size, q_len, self.nheads * self.emb_v_per_head)
+        gate = F.silu(self.gate_proj(q))
+        attn = gate * attn
         out = self.dense(attn)
 
-        # if use_cache=True, we return the hidden_state as well as the kv cache
+        # if use_cache=True, we return the hidden_state as well as the kv cache.
+        # Trim the returned cache to at most `sliding_window` most-recent entries so
+        # cache size stays bounded — keep computed attention intact for this step.
         if use_cache:
+            if keys_return.shape[2] > self.sliding_window:
+                keys_return = keys_return[:, :, -self.sliding_window :, :].contiguous()
+                values_return = values_return[
+                    :, :, -self.sliding_window :, :
+                ].contiguous()
             return out, (keys_return, values_return)
         else:
             return out
@@ -736,6 +830,7 @@ class TPMultiHeadAttention(MultiHeadAttention, TPModule):
         group: Optional[ProcessGroup] = None,
         linear_config: Optional[Mapping[str, Any]] = None,
         scale_factor: Optional[float] = None,
+        sliding_window: int = 512,
     ):
         assert torch.distributed.is_initialized()
 
@@ -761,6 +856,7 @@ class TPMultiHeadAttention(MultiHeadAttention, TPModule):
             fused,
             linear_config,
             scale_factor,
+            sliding_window,
         )
         self.pre_tp_nheads = nheads
         self.pre_tp_kvheads = kvheads
@@ -794,6 +890,9 @@ class TPMultiHeadAttention(MultiHeadAttention, TPModule):
                     0,
                     [self.pre_tp_nheads, self.pre_tp_kvheads, self.pre_tp_kvheads],
                 ),
+                "gate_proj": LinearModuleShardingInfo(
+                    self.gate_proj, 0, [self.pre_tp_nheads]
+                ),
                 "dense": LinearModuleShardingInfo(self.dense, 1, [self.world_size]),
             }
         else:
@@ -806,6 +905,9 @@ class TPMultiHeadAttention(MultiHeadAttention, TPModule):
                 ),
                 "value": LinearModuleShardingInfo(
                     self.in_proj.get_submodule("value"), 0, [self.pre_tp_kvheads]
+                ),
+                "gate_proj": LinearModuleShardingInfo(
+                    self.gate_proj, 0, [self.pre_tp_nheads]
                 ),
                 "dense": LinearModuleShardingInfo(self.dense, 1, [self.world_size]),
             }
@@ -835,6 +937,7 @@ class TPMultiHeadAttention(MultiHeadAttention, TPModule):
             fused=mha.fused,
             linear_config=mha.linear_config,
             scale_factor=mha.scale_factor,
+            sliding_window=mha.sliding_window,
         )
         return tp_mha
 
