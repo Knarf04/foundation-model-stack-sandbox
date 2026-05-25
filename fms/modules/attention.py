@@ -803,7 +803,10 @@ class MultiHeadAttention(nn.Module):
     @torch.compile
     def _gen_affinity_scores(self, k, src, dest, r):
         # affinity = torch.einsum('bnqh, bnkh -> bnqk', k*dest.sqrt().unsqueeze(-1), k*src.sqrt().unsqueeze(-1)).relu().float().pow(2/3)
-        affinity = torch.einsum('bnqh, bnkh -> bnqk', k*dest.sqrt().unsqueeze(-1), k*src.sqrt().unsqueeze(-1)).relu().float().pow(2/3)
+        k = torch.ones_like(k[:,:,:,:1])
+        # src = torch.ones_like(src)
+        dest = torch.ones_like(dest)
+        affinity = torch.einsum('bnqh, bnkh -> bnqk', k*dest.sqrt().unsqueeze(-1), k*src.sqrt().unsqueeze(-1)).relu().float().pow(2)
         affinity = torch.log1p(affinity.clamp(min=0, max=1-1e-6).neg())
         affinity = affinity.tril(-1).cumsum(2).to(dtype=k.dtype)
         cache_affs = affinity[:,:,-1]  # b h l — accumulated decay from last position, for cache init
