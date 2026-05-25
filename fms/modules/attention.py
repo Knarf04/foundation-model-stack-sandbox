@@ -441,6 +441,7 @@ class MultiHeadAttention(nn.Module):
     _prune_prefill_accum = []
     _prune_prefill_nlayers = 0
     _prune_decode_nlayers = 0
+    _prune_registered = False
 
     @classmethod
     def _flush_prune_stats(cls):
