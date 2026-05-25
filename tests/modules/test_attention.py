@@ -32,30 +32,31 @@ def _build_mha(sliding_window: int, with_rope: bool = True):
 
 class SlidingWindowMaskTests(unittest.TestCase):
     def test_mask_shape_and_pattern(self):
-        """Each query t attends exactly to keys in [max(0, t-W+1), t]."""
+        """Each query t attends exactly to keys in [max(0, t-W+1), t]. Mask
+        carries a leading batch dim of 1 per the FMS SDPA convention."""
         L = 8
         W = 4
         m = _make_sliding_window_causal_mask(L, L, W, torch.device("cpu"))
-        self.assertEqual(m.shape, (L, L))
+        self.assertEqual(m.shape, (1, L, L))
         self.assertEqual(m.dtype, torch.bool)
+        body = m[0]
         for t in range(L):
             for j in range(L):
                 expected = (j <= t) and (j >= max(0, t - W + 1))
                 self.assertEqual(
-                    bool(m[t, j].item()),
+                    bool(body[t, j].item()),
                     expected,
                     msg=f"mask[{t},{j}] expected {expected}",
                 )
 
     def test_mask_decode_step(self):
-        """Decode step: q_len=1, k_len=L. Single query at position L-1 attends to
-        the most-recent W keys."""
+        """Decode step: q_len=1, k_len=L. Single query at position L-1 attends
+        to the most-recent W keys."""
         L = 10
         W = 4
         m = _make_sliding_window_causal_mask(1, L, W, torch.device("cpu"))
-        self.assertEqual(m.shape, (1, L))
-        attended = m[0].tolist()
-        # Indices L-W..L-1 should be True; everything before False.
+        self.assertEqual(m.shape, (1, 1, L))
+        attended = m[0, 0].tolist()
         expected = [j >= L - W for j in range(L)]
         self.assertEqual(attended, expected)
 

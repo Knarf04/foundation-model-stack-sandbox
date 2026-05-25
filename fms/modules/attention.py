@@ -45,14 +45,21 @@ def _make_sliding_window_causal_mask(
     window_size: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """Build a (q_len, k_len) bool mask for causal sliding-window attention.
+    """Build a (1, q_len, k_len) bool mask for causal sliding-window attention.
 
     True = attend, False = masked. Query at cache-offset position `k_len - q_len + i`
     attends to keys in the half-open range (q_pos - window_size, q_pos].
+
+    Leading batch dim of 1 follows the FMS SDPA mask convention (bs, q_len, k_len);
+    `_sdpa_compute_op` then unsqueezes once to (1, 1, q_len, k_len), which
+    broadcasts cleanly across batch and heads. Returning a bare 2D (q_len, k_len)
+    would be unsqueezed into (q_len, 1, 1, k_len) by that loop and fail to
+    broadcast against (B, H, q_len, k_len).
     """
     q_idx = torch.arange(k_len - q_len, k_len, device=device).unsqueeze(1)
     k_idx = torch.arange(k_len, device=device).unsqueeze(0)
-    return (k_idx <= q_idx) & (k_idx > q_idx - window_size)
+    mask = (k_idx <= q_idx) & (k_idx > q_idx - window_size)
+    return mask.unsqueeze(0)
 
 
 class AttentionKwargs(TypedDict, total=False):
