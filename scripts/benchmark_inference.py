@@ -207,7 +207,7 @@ expected, _ = model.forward(
 )
 expected = torch.argmax(expected, dim=-1)
 
-expected2 = model.forward(next_input, only_last_token=True)
+expected2, _ = model.forward(next_input, only_last_token=True)
 expected2 = torch.argmax(expected2, dim=-1)
 
 torch.testing.assert_close(expected, expected2)
@@ -230,7 +230,7 @@ def one_token(model, use_cache):
             next_val, past_key_value_states=cache, use_cache=True, only_last_token=True
         )
     else:
-        actual = model.forward(next_input, only_last_token=True)
+        actual, _ = model.forward(next_input, only_last_token=True)
     actual = torch.argmax(actual, dim=-1)
     if local_rank == 0 and not args.skip_correctness_check:
         torch.testing.assert_close(actual, expected)

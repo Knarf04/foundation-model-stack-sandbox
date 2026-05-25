@@ -20,7 +20,7 @@ def __one_step(
 ):
     autocast = amp.autocast if grad_scaler is not None else nullcontext
     with autocast():
-        output = model(input)
+        output, _ = model(input)
         loss = loss_fn(output, label)
 
     if grad_scaler is not None:

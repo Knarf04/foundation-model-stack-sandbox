@@ -272,7 +272,7 @@ def generate(
                     kwargs["past_key_value_states"]
                 )
         else:
-            logits = output
+            logits, _ = output
 
         if "only_last_token" not in kwargs:
             logits = logits[:, -1, :]

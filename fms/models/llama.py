@@ -399,10 +399,14 @@ class LLaMA(nn.Module):
             output = output[:, -1, :]
         preds = self.shared(output, reverse=True)
 
+        # Always return a 2-tuple so callers can do `preds, aux = model(...)`
+        # unconditionally. With use_cache=True, aux is the KV cache; otherwise
+        # it's a zero placeholder (no grad) for trainers that expect an aux slot.
         if use_cache:
             return preds, cache
         else:
-            return preds
+            aux = torch.zeros(1, device=preds.device, dtype=preds.dtype)
+            return preds, aux
 
 
 # Register common LLaMA variants with the model registration API
