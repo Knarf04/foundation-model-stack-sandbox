@@ -25,6 +25,7 @@ from fms.distributed.tensorparallel import (
     copy_to_tensor_model_parallel_region,
     reduce_from_tensor_model_parallel_region,
 )
+from fms.modules.layernorm import LayerNormParameterized
 from fms.modules.linear import (
     LinearModuleShardingInfo,
     get_all_linear_type_to_sharding_maps,
@@ -439,7 +440,7 @@ class MultiHeadAttention(nn.Module):
     _prune_accum = []
     _prune_prefill_accum = []
     _prune_prefill_nlayers = 0
-    _prune_registered = False
+    _prune_decode_nlayers = 0
 
     @classmethod
     def _flush_prune_stats(cls):
@@ -476,6 +477,7 @@ class MultiHeadAttention(nn.Module):
         scale_factor: Optional[float] = None,
         prune_thresh: float = .001,
         prune: bool = True,
+        norm_eps: float = 1e-5,
     ):
         super(MultiHeadAttention, self).__init__()
         self.nheads = nheads
@@ -488,7 +490,9 @@ class MultiHeadAttention(nn.Module):
         self.fused = fused
         self.linear_config = linear_config
         self.scale_factor = scale_factor
-        
+        self.norm_eps = norm_eps
+        self.scale = scale_factor if scale_factor is not None else self.emb_kq_per_head ** -0.5
+
         self.thresh = prune_thresh
         self.prune = prune
 
@@ -521,6 +525,24 @@ class MultiHeadAttention(nn.Module):
             # linear_config=linear_config,
         )
 
+        # Qwen3-style RMSNorm on q and k (per-head, normalizes last dim = emb_kq_per_head)
+        self.q_norm = LayerNormParameterized(
+            self.emb_kq_per_head,
+            elementwise_scale=True,
+            elementwise_shift=False,
+            use_mean=False,
+            eps=norm_eps,
+            use_high_precision_pow=True,
+        )
+        self.k_norm = LayerNormParameterized(
+            self.emb_kq_per_head,
+            elementwise_scale=True,
+            elementwise_shift=False,
+            use_mean=False,
+            eps=norm_eps,
+            use_high_precision_pow=True,
+        )
+
         if self.p_dropout:
             self.attn_dropout = nn.Dropout(self.p_dropout)
         self.position_encoder = position_encoder
@@ -539,6 +561,8 @@ class MultiHeadAttention(nn.Module):
                     m.bias.data.zero_()
             elif isinstance(m, QKV):
                 m.reset_parameters()
+            elif isinstance(m, LayerNormParameterized):
+                m.reset_parameters()
         static_max = math.log(.1)
         static_min = math.log(.001)
         # nn.init.uniform_(self.wstatic.bias)
@@ -554,7 +578,7 @@ class MultiHeadAttention(nn.Module):
         k: Optional[torch.Tensor] = None,
         v: Optional[torch.Tensor] = None,
         position_ids=None,
-        past_key_value_state: Optional[Tuple[Tensor | None, Tensor | None, Tensor | None, Tensor | None]] = None,
+        past_key_value_state: Optional[Tuple[Tensor | None, Tensor | None, Tensor | None, Tensor | None, Tensor | None]] = None,
         use_cache=False,
         **attn_kwargs: Unpack[AttentionKwargs],
     ):
@@ -596,33 +620,47 @@ class MultiHeadAttention(nn.Module):
         keys = k_out.view(batch_size, q_len, self.kvheads, self.emb_kq_per_head)
         values = v_out.view(batch_size, q_len, self.kvheads, self.emb_v_per_head)
 
-        # Normalize keys
-        keys = keys / keys.pow(2).sum(-1, True).sqrt().add(1e-6)
+        # Qwen3-style RMSNorm on q and k (learnable per-element gamma on last dim).
+        # Reassigning back to `queries`/`keys` keeps the original variable names; downstream
+        # SDPA uses `keys` directly, and the affinity path uses a derived L2-normalized view.
+        queries = self.q_norm(queries)
+        keys = self.k_norm(keys)
 
-        # You want to apply rotary embeddings pre-cache
+        # Apply rotary embeddings pre-cache (single call; RoPE is orthogonal so it preserves L2).
         if self.position_encoder is not None:
             queries, keys = self.position_encoder.adjusted_qk(
                 queries, keys, position_ids, past_key_value_state, use_cache
             )
 
+        # Per-position L2 norm of `keys` (b q_len kvheads); used as the scalar bridge between
+        # the RMS-normed `keys` (for SDPA) and the unit-L2 `keys_l2` (for affinity/decay).
+        # keys == keys_scale.unsqueeze(-1) * keys_l2  (factored form used at decode)
+        keys_scale = keys.pow(2).sum(-1).sqrt().add(1e-6)
+        keys_l2 = keys / keys_scale.unsqueeze(-1)
+
         if past_key_value_state is not None:
             # Iterative universal attention
             assert q_len == 1, "UA decoding not currently supported for more than 1 token"
-            (k, v, r, a) = past_key_value_state  # bhld, bhld, bhl, bhl
-            k_ = keys.squeeze(1)  # b h d
-            v_ = values.squeeze(1)  # b h d
+            # Cache holds unit-L2 keys plus per-position scalar; keys = s.unsqueeze(-1) * k_l2.
+            (k_l2, s, v, r, a) = past_key_value_state  # b h l d, b h l, b h l d, b h l, b h l
+            k_l2_new = keys_l2.squeeze(1)             # b h d
+            s_new = keys_scale.squeeze(1)             # b h
+            v_ = values.squeeze(1)                    # b h d
             q_ = queries.view(batch_size, -1, self.kvheads, self.emb_kq_per_head).transpose(1, 2)  # b h r d
             static_src = static_src.squeeze(2)  # b h
             static_dest = static_dest.squeeze(2)  # b h
 
-            # Update k/v cache
-            k = torch.cat((k, k_.unsqueeze(2)), dim=2)
-            v = torch.cat((v, v_.unsqueeze(2)), dim=2)
+            # Update caches: factored key storage (k_l2 + scalar s) + v
+            k_l2 = torch.cat((k_l2, k_l2_new.unsqueeze(2)), dim=2)  # b h l+1 d
+            s = torch.cat((s, s_new.unsqueeze(2)), dim=2)           # b h l+1
+            v = torch.cat((v, v_.unsqueeze(2)), dim=2)              # b h l+1 d
 
-            # q/k/k products
-            qkkk = k.matmul(torch.cat([q_, k_.unsqueeze(2)], dim=2).transpose(-1,-2))  # b h l+1 r+1
-            qk = qkkk[...,:-1]  # b h l+1 r
-            kk = qkkk[:,:,:-1,-1]  # b h l
+            # Attention score (factored): qk = (q @ k_l2.T) * s, with 1/sqrt(d) scale.
+            # q @ k_l2.T has shape (b, h, l+1, r); s broadcasts over r via s.unsqueeze(-1).
+            qk = k_l2.matmul(q_.transpose(-1, -2)) * s.unsqueeze(-1) * self.scale  # b h l+1 r
+
+            # Affinity (L2 keys @ new L2 key) — excludes the new position itself
+            kk = k_l2[:, :, :-1].matmul(k_l2_new.unsqueeze(-1)).squeeze(-1)  # b h l
 
             # Calculate decays
             decay = kk.relu().float().pow(2)
@@ -644,19 +682,21 @@ class MultiHeadAttention(nn.Module):
                     avg_pruned = prune_mask.sum(-1).float().mean().item()
                     MultiHeadAttention._prune_accum.append((avg_pruned, kv_len - avg_pruned))
 
-            # Perform scaled attention
+            # Perform scaled attention (qk already has 1/sqrt(d) scale baked in)
             attn = qk.float().add(a_mask.unsqueeze(-1)).softmax(dim=2).to(dtype=v.dtype).transpose(-1,-2).matmul(v)  # b h r d
             attn = attn.transpose(1, 2).contiguous()  # b r h d
-            (keys, values, rates, affs) = k, v, r, a
+            (keys_l2, keys_scale, values, rates, affs) = k_l2, s, v, r, a
             
         else:
             # Flush previous sequence's prune stats on new prefill
             if os.environ.get("PRUNE_LOG_PATH"):
                 MultiHeadAttention._flush_prune_stats()
             # Blockwise universal attention
-            queries = queries.transpose(1,2)   # b hr l d
-            keys = keys.transpose(1,2)  # b h l d
-            values = values.transpose(1,2)  # b h l d
+            queries = queries.transpose(1,2)        # b h_q  l d
+            keys = keys.transpose(1,2)              # b h_kv l d  (RMS-normed, for SDPA)
+            keys_l2 = keys_l2.transpose(1,2)        # b h_kv l d  (unit L2, for affinity)
+            keys_scale = keys_scale.transpose(1,2)  # b h_kv l    (per-position scalar, for cache)
+            values = values.transpose(1,2)          # b h_kv l d
             rates = static_src
 
             r = self.nheads // self.kvheads
@@ -664,7 +704,8 @@ class MultiHeadAttention(nn.Module):
             chunk_size = 4096
 
             if q_len <= chunk_size:
-                mask, affs, aux = self._gen_affinity_scores(keys, static_src, static_dest, r)
+                # Affinity uses unit-L2 keys (preserves the clamp(max=1-1e-6) invariant).
+                mask, affs, aux = self._gen_affinity_scores(keys_l2, static_src, static_dest, r)
                 if os.environ.get("PRUNE_LOG_PREFILL_PATH") and self.prune:
                     _pm = affs.lt(math.log(self.thresh))
                     _avg_p = _pm.sum(-1).float().mean().item()
@@ -672,15 +713,16 @@ class MultiHeadAttention(nn.Module):
                     if len(MultiHeadAttention._prune_prefill_accum) >= MultiHeadAttention._prune_prefill_nlayers:
                         MultiHeadAttention._flush_prune_prefill_stats()
                 torch.backends.cuda.enable_math_sdp(False)
+                # SDPA uses RMS-normed q/k with Qwen3-style 1/sqrt(d) scale.
                 attn = F.scaled_dot_product_attention(
                     queries, keys.repeat(1,r,1,1), values.repeat(1,r,1,1),
-                    attn_mask=mask, scale=1,
+                    attn_mask=mask, scale=self.scale,
                 )  # b h l d
             else:
                 # Fused chunked attention — O(chunk_size^2) peak memory, no O(l^2) mask
-                # Computes affinity on-the-fly via prefix sums instead of materializing full l x l
-                k_dest = keys * static_dest.unsqueeze(-1).sqrt()  # b h l d
-                k_src = keys * static_src.unsqueeze(-1).sqrt()    # b h l d
+                # Affinity is computed from unit-L2 keys; attention scores use the RMS keys.
+                k_dest = keys_l2 * static_dest.unsqueeze(-1).sqrt()  # b h l d
+                k_src = keys_l2 * static_src.unsqueeze(-1).sqrt()    # b h l d
                 n_chunks = (q_len + chunk_size - 1) // chunk_size
                 # prefix[k] tracks cumulative decay to key k from all processed query positions
                 prefix = torch.zeros(batch_size, self.kvheads, q_len,
@@ -702,7 +744,7 @@ class MultiHeadAttention(nn.Module):
                         ki = j * chunk_size
                         kj = min(ki + chunk_size, q_len)
                         c_k = kj - ki
-                        # Pairwise log-decay: (b, kvheads, c_q, c_k) — O(c^2) memory
+                        # Pairwise log-decay (from unit-L2 keys): (b, kvheads, c_q, c_k) — O(c^2) memory
                         log_decay = torch.einsum(
                             'bhqd, bhkd -> bhqk',
                             k_dest[:, :, qi:qj], k_src[:, :, ki:kj]
@@ -725,11 +767,11 @@ class MultiHeadAttention(nn.Module):
                             chunk_aff = chunk_aff.masked_fill(
                                 chunk_aff.lt(math.log(self.thresh)), float('-inf')
                             )
-                        # Repeat for GQA and compute attention
+                        # Repeat for GQA. Attention uses RMS keys; affinity mask is added afterward.
                         chunk_aff = chunk_aff.repeat(1, r, 1, 1)        # b nheads c_q c_k
                         k_chunk = keys[:, :, ki:kj, :].repeat(1, r, 1, 1)
                         v_chunk = values[:, :, ki:kj, :].repeat(1, r, 1, 1)
-                        scores = (q_chunk @ k_chunk.transpose(-1, -2)).float() + chunk_aff.float()
+                        scores = (q_chunk @ k_chunk.transpose(-1, -2)).float() * self.scale + chunk_aff.float()
                         # Online softmax update
                         chunk_max = scores.amax(dim=-1, keepdim=True)
                         m_new = torch.maximum(m_acc, chunk_max)
@@ -794,9 +836,11 @@ class MultiHeadAttention(nn.Module):
         attn = self.gate_proj(q) * attn
         out = self.dense(attn)
 
-        # if use_cache=True, we return the hidden_state as well as the kv cache
+        # if use_cache=True, we return the hidden_state as well as the kv cache.
+        # Cache: (keys_l2, keys_scale, values, rates, affs). The full RMS-normed key tensor
+        # is never materialized in the cache — at decode time we factor as keys = s * k_l2.
         if use_cache:
-            return out, (keys, values, rates, affs)
+            return out, (keys_l2, keys_scale, values, rates, affs)
         else:
             return out, aux
 
@@ -845,6 +889,7 @@ class TPMultiHeadAttention(MultiHeadAttention, TPModule):
         group: Optional[ProcessGroup] = None,
         linear_config: Optional[Mapping[str, Any]] = None,
         scale_factor: Optional[float] = None,
+        norm_eps: float = 1e-5,
     ):
         assert torch.distributed.is_initialized()
 
@@ -870,6 +915,7 @@ class TPMultiHeadAttention(MultiHeadAttention, TPModule):
             fused,
             linear_config,
             scale_factor,
+            norm_eps=norm_eps,
         )
         self.pre_tp_nheads = nheads
         self.pre_tp_kvheads = kvheads
@@ -944,6 +990,7 @@ class TPMultiHeadAttention(MultiHeadAttention, TPModule):
             fused=mha.fused,
             linear_config=mha.linear_config,
             scale_factor=mha.scale_factor,
+            norm_eps=mha.norm_eps,
         )
         return tp_mha
 

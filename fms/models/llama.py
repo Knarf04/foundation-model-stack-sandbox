@@ -105,6 +105,7 @@ class LLaMABlock(nn.Module):
             linear_config=self.config.linear_config,
             prune=self.config.prune,
             prune_thresh=self.config.prune_thresh,
+            norm_eps=self.config.norm_eps,
         )
         self.ff_sub_layer = GatedLinearUnit(
             self.config.emb_dim,
