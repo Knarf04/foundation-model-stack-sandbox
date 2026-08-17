@@ -16,6 +16,7 @@ from fms.distributed.strategy import (
 from fms.modules.attention import (
     AttentionKwargs,
     MultiHeadAttention,
+    get_attention,
     get_attention_type,
 )
 from fms.modules.embedding import WordEmbedding
@@ -59,14 +60,67 @@ class LLaMAConfig(ModelConfig):
     rope_partial: float = 1.0
     linear_config: Optional[Mapping[str, Any]] = None
     fused_weights: bool = True
+    # fla-style per-layer attention selection. Each dict must carry a "layers"
+    # list of layer ids of that type, plus optional per-type overrides:
+    # num_heads, num_kv_heads, rope_theta, rope_scaling, sinks (learned
+    # per-head attention sinks, default False); window_size (swa only,
+    # default 512). Layers listed in neither dict get full attention with the
+    # global config. Example:
+    #   attn={"layers": [4, 12], "num_heads": 16, "rope_theta": 500000.0}
+    #   swa={"layers": [0, 1, 2, 3], "window_size": 512, "sinks": True}
+    attn: Optional[Mapping[str, Any]] = None
+    swa: Optional[Mapping[str, Any]] = None
+
+
+def _resolve_layer_attn(
+    config: LLaMAConfig, layer_idx: int
+) -> Tuple[str, Mapping[str, Any]]:
+    """fla-style per-layer attention selection: pick ("swa", config.swa) or
+    ("attn", config.attn) when layer_idx is listed in that dict's "layers";
+    default to full attention with the global config otherwise."""
+    in_attn = config.attn is not None and layer_idx in config.attn["layers"]
+    in_swa = config.swa is not None and layer_idx in config.swa["layers"]
+    if in_attn and in_swa:
+        raise ValueError(
+            f"layer {layer_idx} is listed in both attn['layers'] and swa['layers']"
+        )
+    if in_swa:
+        return "swa", config.swa
+    if in_attn:
+        return "attn", config.attn
+    return "attn", {}
+
+
+def _validate_layer_attn_cfgs(config: LLaMAConfig) -> None:
+    for name, cfg in (("attn", config.attn), ("swa", config.swa)):
+        if cfg is None:
+            continue
+        if "layers" not in cfg:
+            raise ValueError(
+                f"config.{name} requires a 'layers' list of layer ids"
+            )
+        out_of_range = [i for i in cfg["layers"] if not 0 <= i < config.nlayers]
+        if out_of_range:
+            raise ValueError(
+                f"config.{name}['layers'] contains out-of-range layer ids "
+                f"{out_of_range} for nlayers={config.nlayers}"
+            )
 
 
 class LLaMABlock(nn.Module):
-    def __init__(self, config: LLaMAConfig, rotary_emb: RotaryEmbedding):
+    def __init__(
+        self,
+        config: LLaMAConfig,
+        rotary_emb: RotaryEmbedding,
+        attn_type: str = "attn",
+        attn_cfg: Optional[Mapping[str, Any]] = None,
+    ):
         super(LLaMABlock, self).__init__()
         self.config = config
-        emb_kq = self.config.emb_dim // self.config.nheads
-        emb_v = self.config.emb_dim // self.config.nheads
+        attn_cfg = attn_cfg or {}
+        nheads = attn_cfg.get("num_heads", self.config.nheads)
+        emb_kq = self.config.emb_dim // nheads
+        emb_v = self.config.emb_dim // nheads
 
         self.ln = LayerNormParameterized(
             self.config.emb_dim,
@@ -85,23 +139,26 @@ class LLaMABlock(nn.Module):
             use_high_precision_pow=True,
         )
 
-        if self.config.kvheads == 0:
-            kvheads = self.config.nheads
+        kvheads = attn_cfg.get("num_kv_heads", self.config.kvheads)
+        if kvheads == 0:
+            kvheads = nheads
         else:
-            kvheads = self.config.kvheads
-            assert self.config.nheads % self.config.kvheads == 0
+            assert nheads % kvheads == 0
 
-        self.attn = MultiHeadAttention(
+        self.attn = get_attention(
+            attn_type,
             self.config.emb_dim,
             emb_kq,
             emb_v,
-            self.config.nheads,
+            nheads,
             kvheads,
             p_dropout=self.config.p_dropout,
             use_bias=self.config.attn_bias,
             position_encoder=rotary_emb,
             fused=self.config.fused_weights,
             linear_config=self.config.linear_config,
+            window_size=attn_cfg.get("window_size", 512),
+            use_sinks=attn_cfg.get("sinks", False),
         )
         self.ff_sub_layer = GatedLinearUnit(
             self.config.emb_dim,
@@ -215,16 +272,51 @@ class LLaMA(nn.Module):
             ratio=self.config.rope_theta,
             partial_rope=self.config.rope_partial,
         )
+
+        # Per-layer attention selection (config.attn / config.swa dicts).
+        # A per-type dict overriding num_heads / rope_theta / rope_scaling
+        # needs its own RotaryEmbedding; same-typed layers share one instance.
+        _validate_layer_attn_cfgs(self.config)
+        default_rope_key = (
+            self.config.emb_dim // self.config.nheads,
+            self.config.rope_theta,
+            repr(self.config.rope_scaling),
+        )
+        rope_by_key = {default_rope_key: self.rot_emb}
+        layer_specs = []
+        for i in range(self.config.nlayers):
+            attn_type, attn_cfg = _resolve_layer_attn(self.config, i)
+            head_dim = self.config.emb_dim // attn_cfg.get(
+                "num_heads", self.config.nheads
+            )
+            rope_key = (
+                head_dim,
+                attn_cfg.get("rope_theta", self.config.rope_theta),
+                repr(attn_cfg.get("rope_scaling", self.config.rope_scaling)),
+            )
+            if rope_key not in rope_by_key:
+                rope_by_key[rope_key] = RotaryEmbedding(
+                    dim=rope_key[0],
+                    scaling=attn_cfg.get("rope_scaling", self.config.rope_scaling),
+                    max_seq_len=self.config.max_expected_seq_len,
+                    ratio=rope_key[1],
+                    partial_rope=self.config.rope_partial,
+                )
+            layer_specs.append((attn_type, attn_cfg, rope_by_key[rope_key]))
+
         # RoPE init
         for device in set(
             [param.device for param in self.parameters()]
             + [buffer.device for buffer in self.buffers()]
         ):
-            self.rot_emb.compute_freqs_cis(device, self.config.max_expected_seq_len)
+            for rope in rope_by_key.values():
+                rope.compute_freqs_cis(device, self.config.max_expected_seq_len)
 
         layers = []
-        for i in range(self.config.nlayers):
-            block: nn.Module = LLaMABlock(self.config, self.rot_emb)
+        for i, (attn_type, attn_cfg, rope) in enumerate(layer_specs):
+            block: nn.Module = LLaMABlock(
+                self.config, rope, attn_type=attn_type, attn_cfg=attn_cfg
+            )
             block = self.distributed_strategy.distribute_layer(block, i)
             layers.append(block)
         self.layers = nn.ModuleList(layers)

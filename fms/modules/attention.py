@@ -22,6 +22,7 @@ from fms.distributed.tensorparallel import (
     copy_to_tensor_model_parallel_region,
     reduce_from_tensor_model_parallel_region,
 )
+from fms.modules import flex_utils
 from fms.modules.linear import (
     LinearModuleShardingInfo,
     get_all_linear_type_to_sharding_maps,
@@ -37,29 +38,6 @@ __sdpa_previous_math: bool = torch.backends.cuda.math_sdp_enabled()
 
 
 __type_factory_map: dict[str, dict[str, Callable]] = {}
-
-
-def _make_sliding_window_causal_mask(
-    q_len: int,
-    k_len: int,
-    window_size: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """Build a (1, q_len, k_len) bool mask for causal sliding-window attention.
-
-    True = attend, False = masked. Query at cache-offset position `k_len - q_len + i`
-    attends to keys in the half-open range (q_pos - window_size, q_pos].
-
-    Leading batch dim of 1 follows the FMS SDPA mask convention (bs, q_len, k_len);
-    `_sdpa_compute_op` then unsqueezes once to (1, 1, q_len, k_len), which
-    broadcasts cleanly across batch and heads. Returning a bare 2D (q_len, k_len)
-    would be unsqueezed into (q_len, 1, 1, k_len) by that loop and fail to
-    broadcast against (B, H, q_len, k_len).
-    """
-    q_idx = torch.arange(k_len - q_len, k_len, device=device).unsqueeze(1)
-    k_idx = torch.arange(k_len, device=device).unsqueeze(0)
-    mask = (k_idx <= q_idx) & (k_idx > q_idx - window_size)
-    return mask.unsqueeze(0)
 
 
 class AttentionKwargs(TypedDict, total=False):
@@ -222,10 +200,11 @@ def _sdpa_compute_op(
 ) -> torch.Tensor:
     queries = query.transpose(2, 1)
 
-    # no longer transposing prior to store, so need to check this in case of no cache
-    if key_cache.shape[1] != kvheads and key_cache.shape[2] == kvheads:
-        key_cache = key_cache.transpose(2, 1)
-        value_cache = value_cache.transpose(2, 1)
+    # key_cache/value_cache are always b x kvheads x kv_len x ds: store ops and
+    # the uncached forward path normalize the layout before this op is called.
+    # Do not reintroduce shape-based layout inference here — when
+    # kv_len == kvheads the two layouts are indistinguishable by shape, and a
+    # wrong guess silently swaps the token and head axes
     mask = attn_kwargs.get("mask", None)
 
     # TODO: Once we add alibi support, merge rel pos bias and mask into single float mask
@@ -325,11 +304,79 @@ register_attention_op(
 )
 
 
+class FlexCausalAttentionKwargs(AttentionKwargs):
+    sinks: NotRequired[torch.Tensor]
+
+
+def _flex_causal_compute_op(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    nheads: int,
+    kvheads: int,
+    p_dropout: float,
+    scale_factor: Optional[float],
+    **attn_kwargs,
+) -> torch.Tensor:
+    """Causal full attention through flex_attention, with optional learned
+    sinks. Used by MultiHeadAttention when use_sinks=True: SDPA cannot expose
+    the row logsumexp the sink gate needs, while flex produces it as a free
+    byproduct of its streaming softmax — no logits recomputation."""
+    if p_dropout:
+        raise NotImplementedError("flex_causal has no attention-dropout support")
+    if attn_kwargs.get("mask", None) is not None:
+        raise NotImplementedError(
+            "flex_causal does not support user-supplied dense masks; "
+            "causality is applied via a BlockMask"
+        )
+
+    queries = query.transpose(2, 1)
+    # key_cache/value_cache are always b x kvheads x kv_len x ds: the store op
+    # and the uncached forward path normalize the layout before this op runs.
+    # Do not reintroduce shape-based layout inference here — when
+    # kv_len == kvheads the two layouts are indistinguishable by shape
+
+    q_len = queries.shape[2]
+    k_len = key_cache.shape[2]
+
+    # Decode: the single (newest) query attends to every key — a dense row
+    # needs no BlockMask and stays streamed inside the kernel.
+    if q_len == 1:
+        block_mask = None
+    else:
+        block_mask = flex_utils.get_causal_block_mask(
+            q_len, k_len, str(queries.device)
+        )
+    attn = flex_utils.flex_attention_with_sinks(
+        queries,
+        key_cache,
+        value_cache,
+        block_mask,
+        scale_factor,
+        nheads != kvheads,
+        attn_kwargs.get("sinks", None),
+    )
+
+    # b x h x qlen x ds -> b x qlen x h x ds
+    return attn.transpose(2, 1).contiguous()
+
+
+if flex_utils.flex_attention_available:
+    register_attention_op(
+        "flex_causal",
+        _sdpa_store_op,
+        _flex_causal_compute_op,
+    )
+
+
 def get_attention_type(**attn_kwargs: Unpack[AttentionKwargs]) -> dict[str, Callable]:
     attn_name = attn_kwargs.get("attn_name", "sdpa_causal")
     if attn_name not in __type_factory_map:
         # we can add sdpa default here
-        raise KeyError("")
+        raise KeyError(
+            f"Unknown attention type `{attn_name}`; registered types: "
+            f"{sorted(__type_factory_map.keys())}"
+        )
 
     return __type_factory_map[attn_name]
 
@@ -441,7 +488,7 @@ class UnfusedQKV(QKV):
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.trunc_normal_(m.weight, mean=0.0, std=0.02)
-                if self.use_bias:
+                if m.bias is not None:
                     m.bias.data.zero_()
 
     def forward(
@@ -528,7 +575,7 @@ class FusedQKV(QKV):
 
     def reset_parameters(self):
         nn.init.trunc_normal_(self.qkv_fused.weight, mean=0.0, std=0.02)
-        if self.use_bias:
+        if self.qkv_fused.bias is not None:
             self.qkv_fused.bias.data.zero_()
 
     def forward(
@@ -568,9 +615,12 @@ class MultiHeadAttention(nn.Module):
         (e.g., "torch_linear", "gptq", ...) or a callable for module selection depending
         on module name. Additional config options should be provided as kwargs in
         linear_config.
-    sliding_window : int
-        Causal sliding-window attention size: each query attends to at most
-        `sliding_window` most-recent keys. Defaults to 512.
+    use_sinks : bool
+        If True, add a learned attention sink: one trainable logit per query
+        head (zero-init), entering the softmax denominator with value 0
+        (gpt-oss style). Routes attention through flex_attention (torch >= 2.5)
+        so the sink needs no logits recomputation; incompatible with attention
+        dropout and user-supplied masks.
     """
 
     def __init__(
@@ -586,9 +636,17 @@ class MultiHeadAttention(nn.Module):
         fused: bool = True,
         linear_config: Optional[Mapping[str, Any]] = None,
         scale_factor: Optional[float] = None,
-        sliding_window: int = 512,
+        use_sinks: bool = False,
     ):
         super(MultiHeadAttention, self).__init__()
+        if nheads <= 0 or kvheads <= 0:
+            raise ValueError(
+                f"nheads and kvheads must be positive, got nheads={nheads}, kvheads={kvheads}"
+            )
+        if nheads % kvheads != 0:
+            raise ValueError(
+                f"nheads must be divisible by kvheads, got nheads={nheads}, kvheads={kvheads}"
+            )
         self.nheads = nheads
         self.kvheads = kvheads
         self.emb_dim = emb_dim
@@ -599,7 +657,25 @@ class MultiHeadAttention(nn.Module):
         self.fused = fused
         self.linear_config = linear_config
         self.scale_factor = scale_factor
-        self.sliding_window = sliding_window
+
+        if use_sinks:
+            if not flex_utils.flex_attention_available:
+                raise ImportError(
+                    "use_sinks requires torch.nn.attention.flex_attention "
+                    "(torch >= 2.5) to obtain the row logsumexp without "
+                    "recomputing attention logits"
+                )
+            if self.p_dropout:
+                raise ValueError(
+                    "use_sinks is incompatible with attention dropout "
+                    "(flex_attention has no dropout); use p_dropout=0"
+                )
+            # gpt-oss-style learned attention sink: one logit per query head,
+            # an extra softmax entry with value 0. Zero-init, trained through
+            # the LM loss.
+            self.sinks: Optional[nn.Parameter] = nn.Parameter(torch.zeros(nheads))
+        else:
+            self.sinks = None
 
         self.in_proj: QKV = (FusedQKV if self.fused else UnfusedQKV)(
             self.emb_dim,
@@ -629,26 +705,16 @@ class MultiHeadAttention(nn.Module):
             self.attn_dropout = nn.Dropout(self.p_dropout)
         self.position_encoder = position_encoder
 
-        # Local absolute-position counter for RoPE under trimmed SWA cache.
-        # Plain Python int (not a buffer) so DDP does not try to broadcast it.
-        # Only consistent for batch_size=1, single-stream generation; caller must
-        # invoke reset_position_counter() before each new prompt.
-        self.curr_id = 0
-
-    def reset_position_counter(self):
-        """Reset the local absolute-position counter. Call before each new
-        single-stream generation. A top-level model wrapper can walk modules and
-        invoke this on every MultiHeadAttention submodule."""
-        self.curr_id = 0
-
     def reset_parameters(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.trunc_normal_(m.weight, mean=0.0, std=0.02)
-                if self.use_bias:
+                if m.bias is not None:
                     m.bias.data.zero_()
             elif isinstance(m, QKV):
                 m.reset_parameters()
+        if self.sinks is not None:
+            self.sinks.data.zero_()
 
     def to_tp(self, group: ProcessGroup) -> "TPMultiHeadAttention":
         return TPMultiHeadAttention.import_module(self, group)
@@ -697,37 +763,29 @@ class MultiHeadAttention(nn.Module):
         keys = k_out.view(batch_size, q_len, self.kvheads, self.emb_kq_per_head)
         values = v_out.view(batch_size, q_len, self.kvheads, self.emb_v_per_head)
 
-        # Sliding-window KV cache trimming invalidates implicit cache-length position
-        # derivation in RoPE. Fall back to a local absolute-position counter when no
-        # position_ids is given. Restricted to batch_size=1 single-stream generation.
-        if self.position_encoder is not None and use_cache:
-            if position_ids is None:
-                if batch_size != 1:
-                    raise ValueError(
-                        "Local RoPE position counter only supports batch_size=1. "
-                        "Pass explicit absolute position_ids for batched generation."
-                    )
-                position_ids = torch.arange(
-                    self.curr_id,
-                    self.curr_id + q_len,
-                    device=q.device,
-                    dtype=torch.long,
-                ).unsqueeze(0)
-                self.curr_id += q_len
-            else:
-                # Keep local counter synchronized when caller provides positions.
-                # Local-counter path is single-stream only.
-                if position_ids.shape[0] != 1:
-                    raise ValueError(
-                        "Local RoPE position counter only supports batch_size=1."
-                    )
-                self.curr_id = int(position_ids[0, -1].item()) + 1
-
         # You want to apply rotary embeddings pre-cache
         if self.position_encoder is not None:
             queries, keys = self.position_encoder.adjusted_qk(
                 queries, keys, position_ids, past_key_value_state, use_cache
             )
+
+        # Learned sinks need the row logsumexp, which the SDPA ops cannot
+        # expose without recomputing logits — route through the flex op, which
+        # yields it as a free byproduct of its streaming softmax.
+        if self.sinks is not None:
+            attn_name = attn_kwargs.get("attn_name", "flex_causal")
+            if attn_name not in ("sdpa_causal", "flex_causal"):
+                raise ValueError(
+                    "use_sinks only supports the flex_causal attention op, "
+                    f"got attn_name=`{attn_name}`"
+                )
+            if attn_kwargs.get("mask", None) is not None:
+                raise ValueError(
+                    "use_sinks does not accept a user mask; causality is "
+                    "applied internally via a BlockMask"
+                )
+            attn_kwargs["attn_name"] = "flex_causal"
+            attn_kwargs["sinks"] = self.sinks
 
         attn_compute_dict = get_attention_type(**attn_kwargs)
 
@@ -745,26 +803,14 @@ class MultiHeadAttention(nn.Module):
                 )
             )
         else:
-            keys_compute, values_compute = keys, values
-
-        # keys_compute is either (b, kvheads, k_len, ds) after store-op transpose,
-        # or (b, k_len, kvheads, ds) when no cache was used (raw view).
-        if keys_compute.shape[1] == self.kvheads:
-            k_len = keys_compute.shape[2]
-        else:
-            k_len = keys_compute.shape[1]
-        sw_mask = _make_sliding_window_causal_mask(
-            q_len, k_len, self.sliding_window, q.device
-        )
-        existing = attn_kwargs.get("mask", None)
-        if existing is None:
-            attn_kwargs["mask"] = sw_mask
-        elif existing.dtype == torch.bool:
-            attn_kwargs["mask"] = existing & sw_mask
-        else:
-            attn_kwargs["mask"] = existing.masked_fill(~sw_mask, float("-inf"))
-        # SWA mask already encodes causality; prevent SDPA from also applying is_causal.
-        attn_kwargs["is_causal_mask"] = False
+            # Normalize K/V to b x kvheads x seq_len x ds here so compute ops
+            # never have to infer the layout from tensor shapes: when
+            # seq_len == kvheads, b x seq_len x kvheads x ds and
+            # b x kvheads x seq_len x ds have identical shapes, so a shape-based
+            # guess can silently swap the token and head axes. Store ops uphold
+            # the same b x kvheads x seq_len x ds contract on the cached path.
+            keys_compute = keys.transpose(2, 1)
+            values_compute = values.transpose(2, 1)
 
         if attn_compute_dict["is_prefill"](**attn_kwargs):
             attn = attn_compute_dict["compute_prefill"](
@@ -794,15 +840,8 @@ class MultiHeadAttention(nn.Module):
         attn = gate * attn
         out = self.dense(attn)
 
-        # if use_cache=True, we return the hidden_state as well as the kv cache.
-        # Trim the returned cache to at most `sliding_window` most-recent entries so
-        # cache size stays bounded — keep computed attention intact for this step.
+        # if use_cache=True, we return the hidden_state as well as the kv cache
         if use_cache:
-            if keys_return.shape[2] > self.sliding_window:
-                keys_return = keys_return[:, :, -self.sliding_window :, :].contiguous()
-                values_return = values_return[
-                    :, :, -self.sliding_window :, :
-                ].contiguous()
             return out, (keys_return, values_return)
         else:
             return out
@@ -837,9 +876,15 @@ class TPMultiHeadAttention(MultiHeadAttention, TPModule):
         group: Optional[ProcessGroup] = None,
         linear_config: Optional[Mapping[str, Any]] = None,
         scale_factor: Optional[float] = None,
-        sliding_window: int = 512,
+        use_sinks: bool = False,
     ):
         assert torch.distributed.is_initialized()
+        if use_sinks:
+            # load_weights has no sharding rule for the per-head sink logits,
+            # so trained sinks would be silently dropped on TP conversion.
+            raise NotImplementedError(
+                "use_sinks is not supported with tensor parallelism"
+            )
 
         rank, world_size = distributed.rank_and_world(group)
         assert nheads % world_size == 0, (
@@ -863,7 +908,6 @@ class TPMultiHeadAttention(MultiHeadAttention, TPModule):
             fused,
             linear_config,
             scale_factor,
-            sliding_window,
         )
         self.pre_tp_nheads = nheads
         self.pre_tp_kvheads = kvheads
@@ -944,7 +988,7 @@ class TPMultiHeadAttention(MultiHeadAttention, TPModule):
             fused=mha.fused,
             linear_config=mha.linear_config,
             scale_factor=mha.scale_factor,
-            sliding_window=mha.sliding_window,
+            use_sinks=mha.sinks is not None,
         )
         return tp_mha
 
@@ -1004,3 +1048,36 @@ class TPMultiHeadAttention(MultiHeadAttention, TPModule):
         else:
             out = reduce_from_tensor_model_parallel_region(out_par, self.group)
             return out
+
+
+def get_attention(
+    attn_type: str,
+    *args,
+    window_size: int = 512,
+    **kwargs,
+) -> MultiHeadAttention:
+    """Construct an attention layer by type name.
+
+    attn_type: "attn" / "full_attention" for MultiHeadAttention,
+        "swa" / "sliding_window" for the flex-attention-backed
+        SlidingWindowMultiHeadAttention.
+    window_size: sliding-window size; only used for the swa types.
+
+    Remaining args/kwargs are forwarded to the class constructor (see
+    MultiHeadAttention for the shared signature).
+    """
+    if attn_type in ("attn", "full_attention"):
+        return MultiHeadAttention(*args, **kwargs)
+    if attn_type in ("swa", "sliding_window"):
+        # local import to avoid a circular dependency at module load
+        from fms.modules.sliding_window_attention import (
+            SlidingWindowMultiHeadAttention,
+        )
+
+        return SlidingWindowMultiHeadAttention(
+            *args, sliding_window=window_size, **kwargs
+        )
+    raise ValueError(
+        f"Unknown attention type `{attn_type}`; expected one of "
+        "'attn', 'full_attention', 'swa', 'sliding_window'"
+    )

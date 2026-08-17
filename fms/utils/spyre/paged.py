@@ -136,9 +136,15 @@ def __spyre_paged_store_op(
         keys, values, key_cache, value_cache, attn_kwargs["slot_mapping"]
     )
 
-    # for prefill, we want to return the original keys/values
+    # for prefill, we compute over the original keys/values; _sdpa_compute_op
+    # expects b x kvheads x seq_len x ds, so normalize the layout here
     if attn_kwargs.get("block_table", None) is None:
-        return keys, values, result_key_cache, result_value_cache
+        return (
+            keys.transpose(2, 1),
+            values.transpose(2, 1),
+            result_key_cache,
+            result_value_cache,
+        )
     else:
         return (
             result_key_cache,
