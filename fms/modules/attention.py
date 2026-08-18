@@ -241,10 +241,28 @@ def _sdpa_compute_op(
     if attn_mask is not None and attn_mask.dtype != torch.bool:
         attn_mask = attn_mask.to(dtype=queries.dtype)
 
-    is_causal = attn_kwargs.get(
-        "is_causal_mask",
-        mask is None and not (key_cache.shape[2] != 1 and queries.shape[2] == 1),
-    )
+    # For the causal op (is_causal_mask absent or True), causality is intrinsic
+    # and a user mask is an ADDITIONAL restriction: effective = causal AND user.
+    # Without this, any supplied mask silently disabled causality (is_causal
+    # became False), so e.g. the HF adapter's dense pad-only masks made full
+    # attention bidirectional. Composing is idempotent for masks that already
+    # encode causality. sdpa_bidirectional passes is_causal_mask=False and is
+    # unaffected. Bottom-right aligned for cached calls; a single decode query
+    # attends every key, so composition is skipped there as an identity.
+    is_causal_op = attn_kwargs.get("is_causal_mask", True)
+    q_len = queries.shape[2]
+    k_len = keys_e.shape[2]
+    if is_causal_op and attn_mask is not None and q_len > 1:
+        q_pos = torch.arange(k_len - q_len, k_len, device=queries.device)
+        k_pos = torch.arange(k_len, device=queries.device)
+        causal = (k_pos.unsqueeze(0) <= q_pos.unsqueeze(1)).view(1, 1, q_len, k_len)
+        if attn_mask.dtype == torch.bool:
+            attn_mask = attn_mask & causal
+        else:
+            attn_mask = attn_mask.masked_fill(~causal, float("-inf"))
+        is_causal = False
+    else:
+        is_causal = is_causal_op and attn_mask is None and not (k_len != 1 and q_len == 1)
 
     # TODO: when updating to 2.7, use enable_gqa and stop using keys_e and values_e
     attn = F.scaled_dot_product_attention(

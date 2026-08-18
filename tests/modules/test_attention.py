@@ -98,6 +98,53 @@ class FullAttentionTests(unittest.TestCase):
             out_cached, _ = mha(x, position_ids=pos, use_cache=True)
         torch.testing.assert_close(out_nocache, out_cached, atol=1e-4, rtol=1e-4)
 
+    def test_user_mask_composes_with_causality(self):
+        """Regression: on sdpa_causal a user mask is an additional restriction,
+        not a replacement for causality. An all-True mask (what HF adapters
+        produce for unpadded batches via pad-only mask_2d_to_3d) used to set
+        is_causal=False and silently make full attention bidirectional."""
+        torch.manual_seed(0)
+        mha = _build_mha()
+        L = 8
+        x = torch.randn(1, L, 32)
+        pos = torch.arange(L, dtype=torch.long).unsqueeze(0)
+        ones = torch.ones(1, L, L, dtype=torch.bool)
+
+        with torch.no_grad():
+            out_masked = mha(x, position_ids=pos, mask=ones, use_cache=False)
+            out_causal = mha(x, position_ids=pos, use_cache=False)
+        torch.testing.assert_close(out_masked, out_causal, atol=1e-4, rtol=1e-4)
+
+    def test_float_user_mask_composes_with_causality(self):
+        """Additive all-zeros float mask must likewise keep causality."""
+        torch.manual_seed(0)
+        mha = _build_mha()
+        L = 8
+        x = torch.randn(1, L, 32)
+        pos = torch.arange(L, dtype=torch.long).unsqueeze(0)
+        zeros = torch.zeros(1, L, L)
+
+        with torch.no_grad():
+            out_masked = mha(x, position_ids=pos, mask=zeros, use_cache=False)
+            out_causal = mha(x, position_ids=pos, use_cache=False)
+        torch.testing.assert_close(out_masked, out_causal, atol=1e-4, rtol=1e-4)
+
+    def test_bidirectional_mask_stays_bidirectional(self):
+        """Causality composition must not leak into sdpa_bidirectional: an
+        all-True mask there still means full bidirectional attention."""
+        torch.manual_seed(0)
+        mha = _build_mha(with_rope=False)
+        L = 8
+        x = torch.randn(1, L, 32)
+        ones = torch.ones(1, L, L, dtype=torch.bool)
+
+        with torch.no_grad():
+            out_masked = mha(
+                x, mask=ones, attn_name="sdpa_bidirectional", use_cache=False
+            )
+            out_free = mha(x, attn_name="sdpa_bidirectional", use_cache=False)
+        torch.testing.assert_close(out_masked, out_free, atol=1e-4, rtol=1e-4)
+
     def test_gate_path_active(self):
         """Zeroing gate_proj must zero the output (no bias on the gate, and
         the default dense path has use_bias=False). Confirms the gate is
@@ -164,10 +211,10 @@ class FullAttentionSinkTests(unittest.TestCase):
         return with_sinks.to("cuda"), without.to("cuda")
 
     def test_masked_neg_sink_matches_masked_base(self):
-        """flex_causal composes causality with the user mask; with the sink
-        disabled (s -> -inf) it must match the sdpa twin given the explicit
-        (causal & user) mask (the sdpa path expects causality inside a user
-        mask, since supplying one sets is_causal=False)."""
+        """Both paths now compose causality with a user mask internally
+        (flex_causal via BlockMask, sdpa_causal via causal AND user), so with
+        the sink disabled (s -> -inf) the two twins must agree given the same
+        raw user mask — cross-validating the two composition implementations."""
         mha_sink, mha_base = self._twins()
         mha_sink.sinks.data.fill_(-1e4)
         L = 12
@@ -177,14 +224,9 @@ class FullAttentionSinkTests(unittest.TestCase):
         user = torch.rand(1, L, L) > 0.3
         user |= torch.eye(L, dtype=torch.bool).unsqueeze(0)
         user = user.to("cuda")
-        causal = torch.tril(
-            torch.ones(L, L, dtype=torch.bool, device="cuda")
-        ).unsqueeze(0)
         with torch.no_grad():
             out_sink = mha_sink(x, position_ids=pos, mask=user, use_cache=False)
-            out_base = mha_base(
-                x, position_ids=pos, mask=causal & user, use_cache=False
-            )
+            out_base = mha_base(x, position_ids=pos, mask=user, use_cache=False)
         torch.testing.assert_close(out_sink, out_base, atol=1e-4, rtol=1e-4)
 
     def test_large_negative_sink_matches_no_sink(self):
