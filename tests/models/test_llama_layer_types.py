@@ -46,6 +46,23 @@ class LlamaLayerTypeConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             LLaMA(_small_config(swa={"window_size": 8}))
 
+    def test_indivisible_num_heads_raises(self):
+        """emb_dim=64 with num_heads=5 would silently truncate head_dim."""
+        with self.assertRaises(ValueError):
+            LLaMA(_small_config(attn={"layers": [0], "num_heads": 5}))
+
+    def test_nonpositive_num_heads_raises(self):
+        with self.assertRaises(ValueError):
+            LLaMA(_small_config(attn={"layers": [0], "num_heads": 0}))
+
+    def test_indivisible_kv_heads_raises(self):
+        with self.assertRaises(ValueError):
+            LLaMA(
+                _small_config(
+                    attn={"layers": [0], "num_heads": 8, "num_kv_heads": 3}
+                )
+            )
+
 
 @unittest.skipUnless(_flex_attention_available, "flex_attention requires torch >= 2.5")
 class LlamaMixedLayerTypeTests(unittest.TestCase):

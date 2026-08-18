@@ -68,13 +68,6 @@ class SlidingWindowConstructionTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 _build_swa(sliding_window=bad)
 
-    def test_user_mask_rejected(self):
-        swa = _build_swa(sliding_window=4)
-        x = torch.randn(1, 6, 32)
-        mask = torch.ones(1, 6, 6, dtype=torch.bool)
-        with self.assertRaises(ValueError):
-            swa(x, mask=mask, use_cache=False)
-
     def test_foreign_attn_name_rejected(self):
         swa = _build_swa(sliding_window=4)
         x = torch.randn(1, 6, 32)
@@ -92,13 +85,98 @@ class SlidingWindowAttentionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             swa(x, use_cache=True)
 
-    def test_batched_explicit_position_ids_raises(self):
-        """Local counter only supports batch=1, even with explicit positions."""
+    def test_batched_explicit_position_ids_ok(self):
+        """Batched cached forward with explicit absolute position_ids is
+        supported: the positions are used as given, the single-stream counter
+        stays untouched, and each row matches its own single-stream run."""
+        torch.manual_seed(0)
         swa = _build_swa(sliding_window=4, with_rope=True)
         x = torch.randn(2, 6, 32)
         pos = torch.arange(6, dtype=torch.long).unsqueeze(0).expand(2, -1)
-        with self.assertRaises(ValueError):
-            swa(x, position_ids=pos, use_cache=True)
+
+        counter_before = swa.curr_id
+        with torch.no_grad():
+            out, _ = swa(x, position_ids=pos, use_cache=True)
+        self.assertEqual(out.shape, x.shape)
+        self.assertEqual(swa.curr_id, counter_before)
+
+        with torch.no_grad():
+            out_row0 = swa(x[0:1], position_ids=pos[0:1], use_cache=False)
+        torch.testing.assert_close(out[0:1], out_row0, atol=1e-4, rtol=1e-4)
+
+    def test_user_bool_mask_composes(self):
+        """A user mask must AND with the window. Reference: the dense sdpa
+        path on the same weights with (window & user) as an explicit mask."""
+        torch.manual_seed(0)
+        sliding_window, L = 4, 12
+        swa = _build_swa(sliding_window=sliding_window, with_rope=True)
+        x = torch.randn(1, L, 32)
+        pos = torch.arange(L, dtype=torch.long).unsqueeze(0)
+        torch.manual_seed(1)
+        user = torch.rand(1, L, L) > 0.3
+        user |= torch.eye(L, dtype=torch.bool).unsqueeze(0)  # no empty rows
+
+        with torch.no_grad():
+            out = swa(x, position_ids=pos, mask=user, use_cache=False)
+            out_ref = MultiHeadAttention.forward(
+                swa,
+                x,
+                position_ids=pos,
+                use_cache=False,
+                attn_name="sdpa_causal",
+                mask=_dense_window_mask(L, L, sliding_window) & user,
+            )
+        torch.testing.assert_close(out, out_ref, atol=1e-4, rtol=1e-4)
+
+    def test_user_float_mask_composes(self):
+        """Additive float masks (0 = attend, -1e9 = masked) go through a
+        score_mod and must match the equivalent boolean mask."""
+        torch.manual_seed(0)
+        sliding_window, L = 4, 12
+        swa = _build_swa(sliding_window=sliding_window, with_rope=True)
+        x = torch.randn(1, L, 32)
+        pos = torch.arange(L, dtype=torch.long).unsqueeze(0)
+        torch.manual_seed(1)
+        user = torch.rand(1, L, L) > 0.3
+        user |= torch.eye(L, dtype=torch.bool).unsqueeze(0)
+        float_mask = torch.where(user, 0.0, -1e9)
+
+        with torch.no_grad():
+            out_float = swa(x, position_ids=pos, mask=float_mask, use_cache=False)
+            out_bool = swa(x, position_ids=pos, mask=user, use_cache=False)
+        torch.testing.assert_close(out_float, out_bool, atol=1e-4, rtol=1e-4)
+
+    def test_masked_prefill_vs_decode_equivalence(self):
+        """Padding-style mask through cached decode: masked columns must not
+        change parity between full prefill and token-by-token decode. Uses a
+        left-pad-style mask that blanks the first two keys for every query."""
+        torch.manual_seed(0)
+        sliding_window, L = 4, 10
+        swa = _build_swa(sliding_window=sliding_window, with_rope=True)
+        x = torch.randn(1, L, 32)
+        keep = torch.ones(1, L, L, dtype=torch.bool)
+        keep[:, :, :2] = False
+        keep |= torch.eye(L, dtype=torch.bool).unsqueeze(0)
+
+        pos = torch.arange(L, dtype=torch.long).unsqueeze(0)
+        with torch.no_grad():
+            out_prefill = swa(x, position_ids=pos, mask=keep, use_cache=False)
+
+        swa.reset_position_counter()
+        cache = None
+        outs = []
+        with torch.no_grad():
+            for t in range(L):
+                out_t, cache = swa(
+                    x[:, t : t + 1, :],
+                    position_ids=torch.tensor([[t]], dtype=torch.long),
+                    mask=keep[:, t : t + 1, : t + 1],
+                    past_key_value_state=cache,
+                    use_cache=True,
+                )
+                outs.append(out_t)
+        out_decode = torch.cat(outs, dim=1)
+        torch.testing.assert_close(out_prefill, out_decode, atol=1e-4, rtol=1e-4)
 
     def test_position_counter_lifecycle(self):
         """curr_id starts at 0, advances by q_len each forward, syncs to last+1
@@ -240,6 +318,21 @@ class SlidingWindowAttentionTests(unittest.TestCase):
 
 
 @unittest.skipUnless(_flex_available, "flex_attention requires torch >= 2.5")
+class SlidingWindowSinkCpuGuardTests(unittest.TestCase):
+    def test_sinks_on_cpu_raise(self):
+        """The CPU flex backend exposes no lse (and has no backward), so
+        sink-enabled attention must fail early with a clear error."""
+        swa = _build_swa(sliding_window=4, use_sinks=True)
+        x = torch.randn(1, 6, 32)
+        pos = torch.arange(6, dtype=torch.long).unsqueeze(0)
+        with self.assertRaises(RuntimeError):
+            swa(x, position_ids=pos, use_cache=False)
+
+
+@unittest.skipUnless(
+    _flex_available and torch.cuda.is_available(),
+    "sink gating needs the flex lse, which the CPU backend does not provide",
+)
 class SlidingWindowSinkTests(unittest.TestCase):
     """Learned sink = extra softmax entry with logit s_h and value 0, applied
     as a sigmoid(lse - s_h) output gate from flex's lse — no logits recompute."""
@@ -251,7 +344,7 @@ class SlidingWindowSinkTests(unittest.TestCase):
         with_sinks = _build_swa(sliding_window=sliding_window, use_sinks=True)
         torch.manual_seed(42)
         without = _build_swa(sliding_window=sliding_window, use_sinks=False)
-        return with_sinks, without
+        return with_sinks.to("cuda"), without.to("cuda")
 
     def test_large_negative_sink_matches_no_sink(self):
         """s_h -> -inf makes the sink weight e^{s_h} vanish: outputs must match
@@ -259,8 +352,8 @@ class SlidingWindowSinkTests(unittest.TestCase):
         swa_sink, swa_base = self._twins()
         swa_sink.sinks.data.fill_(-1e4)
         L = 12
-        x = torch.randn(1, L, 32)
-        pos = torch.arange(L, dtype=torch.long).unsqueeze(0)
+        x = torch.randn(1, L, 32, device="cuda")
+        pos = torch.arange(L, dtype=torch.long, device="cuda").unsqueeze(0)
         with torch.no_grad():
             out_sink = swa_sink(x, position_ids=pos, use_cache=False)
             out_base = swa_base(x, position_ids=pos, use_cache=False)
@@ -270,8 +363,8 @@ class SlidingWindowSinkTests(unittest.TestCase):
         """s_h -> +inf absorbs all attention mass into the zero-valued sink."""
         swa_sink, _ = self._twins()
         swa_sink.sinks.data.fill_(1e4)
-        x = torch.randn(1, 12, 32)
-        pos = torch.arange(12, dtype=torch.long).unsqueeze(0)
+        x = torch.randn(1, 12, 32, device="cuda")
+        pos = torch.arange(12, dtype=torch.long, device="cuda").unsqueeze(0)
         with torch.no_grad():
             out = swa_sink(x, position_ids=pos, use_cache=False)
         torch.testing.assert_close(out, torch.zeros_like(out), atol=1e-5, rtol=0)
@@ -284,9 +377,9 @@ class SlidingWindowSinkTests(unittest.TestCase):
         torch.manual_seed(7)
         swa_sink.sinks.data.normal_(std=1.0)
         L = 12
-        x = torch.randn(1, L, 32)
+        x = torch.randn(1, L, 32, device="cuda")
 
-        pos = torch.arange(L, dtype=torch.long).unsqueeze(0)
+        pos = torch.arange(L, dtype=torch.long, device="cuda").unsqueeze(0)
         with torch.no_grad():
             out_prefill = swa_sink(x, position_ids=pos, use_cache=False)
 
@@ -297,7 +390,9 @@ class SlidingWindowSinkTests(unittest.TestCase):
             for t in range(L):
                 out_t, cache = swa_sink(
                     x[:, t : t + 1, :],
-                    position_ids=torch.tensor([[t]], dtype=torch.long),
+                    position_ids=torch.tensor(
+                        [[t]], dtype=torch.long, device="cuda"
+                    ),
                     past_key_value_state=cache,
                     use_cache=True,
                 )
@@ -307,8 +402,8 @@ class SlidingWindowSinkTests(unittest.TestCase):
 
     def test_sink_gradients_flow(self):
         swa_sink, _ = self._twins()
-        x = torch.randn(1, 8, 32)
-        pos = torch.arange(8, dtype=torch.long).unsqueeze(0)
+        x = torch.randn(1, 8, 32, device="cuda")
+        pos = torch.arange(8, dtype=torch.long, device="cuda").unsqueeze(0)
         out = swa_sink(x, position_ids=pos, use_cache=False)
         out.sum().backward()
         self.assertIsNotNone(swa_sink.sinks.grad)

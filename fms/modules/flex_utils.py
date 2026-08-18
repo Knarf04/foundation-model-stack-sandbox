@@ -61,37 +61,127 @@ def call_flex_attention(*args, **kwargs):
     return _flex_attention_fn(*args, **kwargs)
 
 
-@functools.lru_cache(maxsize=32)
-def get_sliding_window_block_mask(
-    q_len: int, k_len: int, window_size: int, device: str
-):
-    """Build (and cache) a causal sliding-window BlockMask. Query at
-    cache-offset position `k_len - q_len + i` attends to keys in the half-open
-    range (q_pos - window_size, q_pos]. Cache is keyed on shapes only, so all
-    layers of a model share one mask per step."""
-    offset = k_len - q_len
+def sliding_window_mask_mod(offset: int, window_size: int) -> Callable:
+    """mask_mod for causal sliding-window attention: query at cache-offset
+    position `q_idx + offset` attends to keys in (q_pos - window_size, q_pos]."""
 
     def mask_mod(b, h, q_idx, kv_idx):
         q_pos = q_idx + offset
         return (kv_idx <= q_pos) & (kv_idx > q_pos - window_size)
 
+    return mask_mod
+
+
+def causal_mask_mod(offset: int) -> Callable:
+    """mask_mod for bottom-right-aligned causal attention: query at
+    cache-offset position `q_idx + offset` attends to keys [0, q_pos]."""
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        return kv_idx <= q_idx + offset
+
+    return mask_mod
+
+
+@functools.lru_cache(maxsize=32)
+def get_sliding_window_block_mask(
+    q_len: int, k_len: int, window_size: int, device: str
+):
+    """Build (and cache) a causal sliding-window BlockMask. Cache is keyed on
+    shapes only, so all layers of a model share one mask per step."""
     return create_block_mask(
-        mask_mod, B=None, H=None, Q_LEN=q_len, KV_LEN=k_len, device=device
+        sliding_window_mask_mod(k_len - q_len, window_size),
+        B=None,
+        H=None,
+        Q_LEN=q_len,
+        KV_LEN=k_len,
+        device=device,
     )
 
 
 @functools.lru_cache(maxsize=32)
 def get_causal_block_mask(q_len: int, k_len: int, device: str):
-    """Build (and cache) a bottom-right-aligned causal BlockMask: query at
-    cache-offset position `k_len - q_len + i` attends to keys [0, q_pos]."""
-    offset = k_len - q_len
+    """Build (and cache) a bottom-right-aligned causal BlockMask."""
+    return create_block_mask(
+        causal_mask_mod(k_len - q_len),
+        B=None,
+        H=None,
+        Q_LEN=q_len,
+        KV_LEN=k_len,
+        device=device,
+    )
 
-    def mask_mod(b, h, q_idx, kv_idx):
-        return kv_idx <= q_idx + offset
+
+def normalize_attention_mask(
+    mask: torch.Tensor, batch_size: int, q_len: int, k_len: int
+) -> torch.Tensor:
+    """Normalize a user attention mask to (batch_size, q_len, k_len), bottom-
+    right aligned. Accepts (q, k), (b, q, k), or (b, 1, q, k); True/0 = attend.
+
+    Rows/columns beyond (q_len, k_len) are sliced off the top/left: with a
+    trimmed SWA cache the cache holds the most recent k_len keys, so the last
+    k_len mask columns are the ones that correspond to it."""
+    if mask.dim() == 2:
+        mask = mask.unsqueeze(0)
+    elif mask.dim() == 4:
+        if mask.shape[1] != 1:
+            raise ValueError(
+                "per-head attention masks are not supported on the flex path; "
+                f"got mask of shape {tuple(mask.shape)}"
+            )
+        mask = mask.squeeze(1)
+    elif mask.dim() != 3:
+        raise ValueError(f"unsupported attention mask rank: {tuple(mask.shape)}")
+    if mask.shape[-2] < q_len or mask.shape[-1] < k_len:
+        raise ValueError(
+            f"attention mask of shape {tuple(mask.shape)} is smaller than "
+            f"(q_len={q_len}, k_len={k_len})"
+        )
+    mask = mask[:, -q_len:, -k_len:]
+    if mask.shape[0] == 1 and batch_size > 1:
+        mask = mask.expand(batch_size, -1, -1)
+    return mask.contiguous()
+
+
+def compose_block_mask(
+    base_mask_mod: Optional[Callable],
+    user_mask: torch.Tensor,
+    q_len: int,
+    k_len: int,
+    device: str,
+):
+    """BlockMask for `base & user`: allowed(b,q,k) = base(q,k) AND user[b,q,k].
+
+    user_mask must be bool (batch, q_len, k_len), True = attend. Built per call
+    (the captured tensor prevents shape-keyed caching); pass base_mask_mod=None
+    when the base allows everything (e.g. a single decode query)."""
+    if base_mask_mod is None:
+
+        def mask_mod(b, h, q_idx, kv_idx):
+            return user_mask[b][q_idx][kv_idx]
+    else:
+
+        def mask_mod(b, h, q_idx, kv_idx):
+            return base_mask_mod(b, h, q_idx, kv_idx) & user_mask[b][q_idx][kv_idx]
 
     return create_block_mask(
-        mask_mod, B=None, H=None, Q_LEN=q_len, KV_LEN=k_len, device=device
+        mask_mod,
+        B=user_mask.shape[0],
+        H=None,
+        Q_LEN=q_len,
+        KV_LEN=k_len,
+        device=device,
     )
+
+
+def additive_score_mod(bias: torch.Tensor) -> Callable:
+    """score_mod adding a float mask (batch, q_len, k_len) to the logits
+    (0 = attend, large negative = masked). The lse then includes the bias, so
+    sink gating composes with it for free."""
+
+    def score_mod(score, b, h, q_idx, kv_idx):
+        return score + bias[b][q_idx][kv_idx]
+
+    return score_mod
 
 
 def apply_sink_gate(
@@ -133,17 +223,34 @@ def flex_attention_with_sinks(
     scale: Optional[float],
     enable_gqa: bool,
     sinks: Optional[torch.Tensor],
+    score_mod: Optional[Callable] = None,
 ) -> torch.Tensor:
     """flex_attention with an optional learned sink, without recomputing any
     logits: the row logsumexp comes back as a byproduct of the streaming
-    softmax and the output is renormalized by sigmoid(lse - s_h).
+    softmax and the output is renormalized by sigmoid(lse - s_h). An optional
+    score_mod (e.g. an additive float mask) is folded into the logits, so the
+    lse — and therefore the sink gate — accounts for it automatically.
 
     Stock PyTorch flex_attention has no native sink argument; this LSE
     renormalization is the canonical implementation (it is also how Hugging
     Face's FlexAttention backend realizes gpt-oss-style sinks). The lse
     participates in flex's backward interface, so the sink trains normally."""
-    flex_kwargs = dict(block_mask=block_mask, scale=scale, enable_gqa=enable_gqa)
+    flex_kwargs = dict(
+        score_mod=score_mod,
+        block_mask=block_mask,
+        scale=scale,
+        enable_gqa=enable_gqa,
+    )
     if sinks is None:
         return call_flex_attention(queries, keys, values, **flex_kwargs)
+    if queries.device.type == "cpu":
+        # The CPU flex backend does not expose the lse (and has no backward),
+        # so sink gating cannot run there. Fail early with a clear message
+        # instead of deep inside the kernel.
+        raise RuntimeError(
+            "attention sinks need the row logsumexp from flex_attention, "
+            "which the CPU flex backend does not provide; run sink-enabled "
+            "attention on CUDA"
+        )
     attn, lse = _flex_attention_with_lse(queries, keys, values, **flex_kwargs)
     return apply_sink_gate(attn, lse, sinks)

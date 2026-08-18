@@ -306,6 +306,8 @@ register_attention_op(
 
 class FlexCausalAttentionKwargs(AttentionKwargs):
     sinks: NotRequired[torch.Tensor]
+    # user mask (padding/packing), True/0 = attend; composed with causality
+    mask: NotRequired[torch.Tensor]
 
 
 def _flex_causal_compute_op(
@@ -321,14 +323,14 @@ def _flex_causal_compute_op(
     """Causal full attention through flex_attention, with optional learned
     sinks. Used by MultiHeadAttention when use_sinks=True: SDPA cannot expose
     the row logsumexp the sink gate needs, while flex produces it as a free
-    byproduct of its streaming softmax — no logits recomputation."""
+    byproduct of its streaming softmax — no logits recomputation.
+
+    A user mask (padding/packing, FMS bs x q_len x kv_len convention) is
+    composed with causality: allowed(b,q,k) = causal(q,k) AND user(b,q,k).
+    Boolean masks fold into the BlockMask; additive float masks become a
+    score_mod, so the lse (and hence the sink gate) accounts for them."""
     if p_dropout:
         raise NotImplementedError("flex_causal has no attention-dropout support")
-    if attn_kwargs.get("mask", None) is not None:
-        raise NotImplementedError(
-            "flex_causal does not support user-supplied dense masks; "
-            "causality is applied via a BlockMask"
-        )
 
     queries = query.transpose(2, 1)
     # key_cache/value_cache are always b x kvheads x kv_len x ds: the store op
@@ -336,17 +338,39 @@ def _flex_causal_compute_op(
     # Do not reintroduce shape-based layout inference here — when
     # kv_len == kvheads the two layouts are indistinguishable by shape
 
+    batch_size = queries.shape[0]
     q_len = queries.shape[2]
     k_len = key_cache.shape[2]
+    device = str(queries.device)
 
+    mask = attn_kwargs.get("mask", None)
+    user = (
+        None
+        if mask is None
+        else flex_utils.normalize_attention_mask(mask, batch_size, q_len, k_len)
+    )
     # Decode: the single (newest) query attends to every key — a dense row
-    # needs no BlockMask and stays streamed inside the kernel.
-    if q_len == 1:
-        block_mask = None
-    else:
-        block_mask = flex_utils.get_causal_block_mask(
-            q_len, k_len, str(queries.device)
+    # needs no causal BlockMask and stays streamed inside the kernel.
+    base_mod = None if q_len == 1 else flex_utils.causal_mask_mod(k_len - q_len)
+    score_mod = None
+    if user is None:
+        block_mask = (
+            None
+            if base_mod is None
+            else flex_utils.get_causal_block_mask(q_len, k_len, device)
         )
+    elif user.dtype == torch.bool:
+        block_mask = flex_utils.compose_block_mask(
+            base_mod, user, q_len, k_len, device
+        )
+    else:
+        block_mask = (
+            None
+            if base_mod is None
+            else flex_utils.get_causal_block_mask(q_len, k_len, device)
+        )
+        score_mod = flex_utils.additive_score_mod(user)
+
     attn = flex_utils.flex_attention_with_sinks(
         queries,
         key_cache,
@@ -355,6 +379,7 @@ def _flex_causal_compute_op(
         scale_factor,
         nheads != kvheads,
         attn_kwargs.get("sinks", None),
+        score_mod=score_mod,
     )
 
     # b x h x qlen x ds -> b x qlen x h x ds
@@ -779,11 +804,6 @@ class MultiHeadAttention(nn.Module):
                     "use_sinks only supports the flex_causal attention op, "
                     f"got attn_name=`{attn_name}`"
                 )
-            if attn_kwargs.get("mask", None) is not None:
-                raise ValueError(
-                    "use_sinks does not accept a user mask; causality is "
-                    "applied internally via a BlockMask"
-                )
             attn_kwargs["attn_name"] = "flex_causal"
             attn_kwargs["sinks"] = self.sinks
 
@@ -879,12 +899,6 @@ class TPMultiHeadAttention(MultiHeadAttention, TPModule):
         use_sinks: bool = False,
     ):
         assert torch.distributed.is_initialized()
-        if use_sinks:
-            # load_weights has no sharding rule for the per-head sink logits,
-            # so trained sinks would be silently dropped on TP conversion.
-            raise NotImplementedError(
-                "use_sinks is not supported with tensor parallelism"
-            )
 
         rank, world_size = distributed.rank_and_world(group)
         assert nheads % world_size == 0, (
@@ -908,6 +922,7 @@ class TPMultiHeadAttention(MultiHeadAttention, TPModule):
             fused,
             linear_config,
             scale_factor,
+            use_sinks=use_sinks,
         )
         self.pre_tp_nheads = nheads
         self.pre_tp_kvheads = kvheads
@@ -933,6 +948,18 @@ class TPMultiHeadAttention(MultiHeadAttention, TPModule):
         till we need to duplicate. For instance if we have nheads=16 and
         world_size=32, then first 2 ranks will get first 1/16th of query
         """
+
+        # The learned sink logits are a plain per-query-head parameter, not a
+        # linear module — shard them with the same query-head partition as
+        # gate_proj (dim 0, blocked by pre-TP head count) before delegating
+        # the linear weights to the registered sharding map.
+        if self.sinks is not None:
+            tensor_values = dict(tensor_values)
+            sinks_used: set = set()
+            sinks_value = self._get_sd_weight(tensor_values, sinks_used, ["sinks"])
+            self.sharded_copy(self.sinks, sinks_value, 0, [self.pre_tp_nheads])
+            for used_key in sinks_used:
+                del tensor_values[used_key]
 
         if self.fused:
             module_sharding_info = {

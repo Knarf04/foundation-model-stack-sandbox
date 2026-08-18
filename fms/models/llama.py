@@ -105,6 +105,30 @@ def _validate_layer_attn_cfgs(config: LLaMAConfig) -> None:
                 f"config.{name}['layers'] contains out-of-range layer ids "
                 f"{out_of_range} for nlayers={config.nlayers}"
             )
+        # Validate the effective head geometry: integer-division head_dim would
+        # otherwise silently shrink the attention width (e.g. emb_dim=4096,
+        # num_heads=60 -> head_dim=68, projection width 4080).
+        nheads = cfg.get("num_heads", config.nheads)
+        if not isinstance(nheads, int) or nheads <= 0:
+            raise ValueError(
+                f"config.{name}['num_heads'] must be a positive int, got {nheads}"
+            )
+        if config.emb_dim % nheads != 0:
+            raise ValueError(
+                f"config.{name}: emb_dim={config.emb_dim} is not divisible by "
+                f"num_heads={nheads}"
+            )
+        kvheads = cfg.get("num_kv_heads", config.kvheads)
+        if not isinstance(kvheads, int) or kvheads < 0:
+            raise ValueError(
+                f"config.{name}['num_kv_heads'] must be a non-negative int "
+                f"(0 means equal to num_heads), got {kvheads}"
+            )
+        if kvheads != 0 and nheads % kvheads != 0:
+            raise ValueError(
+                f"config.{name}: num_heads={nheads} is not divisible by "
+                f"num_kv_heads={kvheads}"
+            )
 
 
 class LLaMABlock(nn.Module):
@@ -139,11 +163,17 @@ class LLaMABlock(nn.Module):
             use_high_precision_pow=True,
         )
 
+        if self.config.emb_dim % nheads != 0:
+            raise ValueError(
+                f"emb_dim={self.config.emb_dim} is not divisible by nheads={nheads}"
+            )
         kvheads = attn_cfg.get("num_kv_heads", self.config.kvheads)
         if kvheads == 0:
             kvheads = nheads
-        else:
-            assert nheads % kvheads == 0
+        elif nheads % kvheads != 0:
+            raise ValueError(
+                f"nheads={nheads} is not divisible by kvheads={kvheads}"
+            )
 
         self.attn = get_attention(
             attn_type,

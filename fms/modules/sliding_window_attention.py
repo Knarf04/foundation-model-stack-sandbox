@@ -29,9 +29,13 @@ from fms.modules.attention import (
     register_attention_op,
 )
 from fms.modules.flex_utils import (
+    additive_score_mod as _additive_score_mod,
+    compose_block_mask as _compose_block_mask,
     flex_attention_available as _flex_attention_available,
     flex_attention_with_sinks as _flex_attention_with_sinks,
     get_sliding_window_block_mask as _get_sliding_window_block_mask,
+    normalize_attention_mask as _normalize_attention_mask,
+    sliding_window_mask_mod as _sliding_window_mask_mod,
 )
 from fms.modules.linear import get_linear_type
 from fms.modules.positions import PositionEncoder
@@ -41,6 +45,9 @@ from fms.modules.tp import TPModule
 class FlexSlidingWindowAttentionKwargs(AttentionKwargs):
     sliding_window: NotRequired[int]
     sinks: NotRequired[torch.Tensor]
+    # user mask (padding/packing/document boundaries), True/0 = attend;
+    # composed with the sliding window inside the op
+    mask: NotRequired[torch.Tensor]
 
 
 def _flex_swa_compute_op(
@@ -57,11 +64,6 @@ def _flex_swa_compute_op(
         raise NotImplementedError(
             "flex_sliding_window has no attention-dropout support"
         )
-    if attn_kwargs.get("mask", None) is not None:
-        raise NotImplementedError(
-            "flex_sliding_window does not combine user-supplied dense masks "
-            "with the sliding window"
-        )
 
     queries = query.transpose(2, 1)
     # key_cache/value_cache are always b x kvheads x kv_len x ds: the store op
@@ -72,49 +74,100 @@ def _flex_swa_compute_op(
 
     window_size = attn_kwargs["sliding_window"]
     sinks = attn_kwargs.get("sinks", None)
+    mask = attn_kwargs.get("mask", None)
+    batch_size = queries.shape[0]
     q_len = queries.shape[2]
     k_len = key_cache.shape[2]
+    enable_gqa = nheads != kvheads
+    device = str(queries.device)
+
+    # A user mask (padding, packing, document boundaries) composes with the
+    # window: allowed(b,q,k) = window(q,k) AND user(b,q,k). Boolean masks fold
+    # into the BlockMask; additive float masks become a score_mod, so the lse
+    # (and hence the sink gate) accounts for them automatically.
 
     # This op is only registered when flex is importable (torch >= 2.5), so
     # SDPA's enable_gqa is also available and manual kv expansion is unneeded.
     if q_len == 1:
         # Decode: the single (newest) query attends to exactly the last
-        # min(window_size, k_len) cache slots, so unmasked dense attention over
-        # that slice is exact — no BlockMask construction per step.
+        # min(window_size, k_len) cache slots, so dense attention over that
+        # slice is exact — no window BlockMask construction per step.
+        keys_s = key_cache[:, :, -window_size:, :]
+        values_s = value_cache[:, :, -window_size:, :]
+        s_len = keys_s.shape[2]
+        user = (
+            None
+            if mask is None
+            else _normalize_attention_mask(mask, batch_size, 1, s_len)
+        )
         if sinks is None:
+            attn_mask = None
+            if user is not None:
+                attn_mask = user.unsqueeze(1)  # b x 1 x 1 x s_len
+                if attn_mask.dtype != torch.bool:
+                    attn_mask = attn_mask.to(dtype=queries.dtype)
             attn = F.scaled_dot_product_attention(
                 queries,
-                key_cache[:, :, -window_size:, :],
-                value_cache[:, :, -window_size:, :],
+                keys_s,
+                values_s,
+                attn_mask=attn_mask,
                 is_causal=False,
                 scale=scale_factor,
-                enable_gqa=nheads != kvheads,
+                enable_gqa=enable_gqa,
             )
         else:
             # Sink gating needs the row logsumexp, which SDPA cannot expose —
-            # flex over the slice (block_mask=None: every sliced key is
-            # attended) yields it as a free byproduct.
+            # flex over the slice yields it as a free byproduct.
+            if user is None:
+                block_mask, score_mod = None, None
+            elif user.dtype == torch.bool:
+                block_mask = _compose_block_mask(None, user, 1, s_len, device)
+                score_mod = None
+            else:
+                block_mask, score_mod = None, _additive_score_mod(user)
             attn = _flex_attention_with_sinks(
                 queries,
-                key_cache[:, :, -window_size:, :],
-                value_cache[:, :, -window_size:, :],
-                None,
+                keys_s,
+                values_s,
+                block_mask,
                 scale_factor,
-                nheads != kvheads,
+                enable_gqa,
                 sinks,
+                score_mod=score_mod,
             )
     else:
-        block_mask = _get_sliding_window_block_mask(
-            q_len, k_len, window_size, str(queries.device)
+        user = (
+            None
+            if mask is None
+            else _normalize_attention_mask(mask, batch_size, q_len, k_len)
         )
+        score_mod = None
+        if user is None:
+            block_mask = _get_sliding_window_block_mask(
+                q_len, k_len, window_size, device
+            )
+        elif user.dtype == torch.bool:
+            block_mask = _compose_block_mask(
+                _sliding_window_mask_mod(k_len - q_len, window_size),
+                user,
+                q_len,
+                k_len,
+                device,
+            )
+        else:
+            block_mask = _get_sliding_window_block_mask(
+                q_len, k_len, window_size, device
+            )
+            score_mod = _additive_score_mod(user)
         attn = _flex_attention_with_sinks(
             queries,
             key_cache,
             value_cache,
             block_mask,
             scale_factor,
-            nheads != kvheads,
+            enable_gqa,
             sinks,
+            score_mod=score_mod,
         )
 
     # b x h x qlen x ds -> b x qlen x h x ds
@@ -222,7 +275,9 @@ class SlidingWindowMultiHeadAttention(MultiHeadAttention):
         """
         Check MultiHeadAttention for the shared arguments and return format.
         This forward always computes through the "flex_sliding_window" op;
-        other attn_name values or a user-supplied mask are rejected.
+        other attn_name values are rejected. A user mask (padding/packing;
+        True/0 = attend, FMS bs x q_len x kv_len convention) is composed with
+        the sliding window inside the op.
         """
         # q, k, v: batch_size x seq_len x emb_dim
         batch_size, q_len, _ = q.size()
@@ -232,11 +287,6 @@ class SlidingWindowMultiHeadAttention(MultiHeadAttention):
             raise ValueError(
                 "SlidingWindowMultiHeadAttention only supports the "
                 f"flex_sliding_window attention op, got attn_name=`{attn_name}`"
-            )
-        if attn_kwargs.get("mask", None) is not None:
-            raise ValueError(
-                "SlidingWindowMultiHeadAttention does not accept a user mask; "
-                "the causal sliding window is applied internally"
             )
         attn_kwargs["attn_name"] = "flex_sliding_window"
         attn_kwargs["sliding_window"] = self.sliding_window
@@ -267,14 +317,14 @@ class SlidingWindowMultiHeadAttention(MultiHeadAttention):
                     dtype=torch.long,
                 ).unsqueeze(0)
                 self.curr_id += q_len
-            else:
-                # Keep local counter synchronized when caller provides positions.
-                # Local-counter path is single-stream only.
-                if position_ids.shape[0] != 1:
-                    raise ValueError(
-                        "Local RoPE position counter only supports batch_size=1."
-                    )
+            elif position_ids.shape[0] == 1:
+                # Keep local counter synchronized when a single-stream caller
+                # provides positions.
                 self.curr_id = int(position_ids[0, -1].item()) + 1
+            # batch > 1 with explicit absolute position_ids: use them as given;
+            # the local counter only tracks single-stream generation. Note that
+            # uniform cache trimming assumes right-aligned sequences — batched
+            # generation with padding needs left padding plus a user mask.
 
         # You want to apply rotary embeddings pre-cache
         if self.position_encoder is not None:
@@ -382,12 +432,6 @@ class TPSlidingWindowMultiHeadAttention(SlidingWindowMultiHeadAttention, TPModul
         use_sinks: bool = False,
     ):
         assert torch.distributed.is_initialized()
-        if use_sinks:
-            # load_weights has no sharding rule for the per-head sink logits,
-            # so trained sinks would be silently dropped on TP conversion.
-            raise NotImplementedError(
-                "use_sinks is not supported with tensor parallelism"
-            )
 
         rank, world_size = distributed.rank_and_world(group)
         assert nheads % world_size == 0, (
@@ -412,6 +456,7 @@ class TPSlidingWindowMultiHeadAttention(SlidingWindowMultiHeadAttention, TPModul
             linear_config,
             scale_factor,
             sliding_window,
+            use_sinks=use_sinks,
         )
         self.pre_tp_nheads = nheads
         self.pre_tp_kvheads = kvheads
