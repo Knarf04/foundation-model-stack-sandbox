@@ -1095,18 +1095,32 @@ class TPMultiHeadAttention(MultiHeadAttention, TPModule):
             return out
 
 
+_ATTENTION_TYPES = (
+    "attn",
+    "full_attention",
+    "swa",
+    "sliding_window",
+    "tele",
+    "telescoping",
+)
+
+
 def get_attention(
     attn_type: str,
     *args,
     window_size: int = 512,
+    telescoping_kwargs: Optional[Mapping[str, Any]] = None,
     **kwargs,
 ) -> MultiHeadAttention:
     """Construct an attention layer by type name.
 
     attn_type: "attn" / "full_attention" for MultiHeadAttention,
         "swa" / "sliding_window" for the flex-attention-backed
-        SlidingWindowMultiHeadAttention.
+        SlidingWindowMultiHeadAttention, "tele" / "telescoping" for the
+        summary-tree TelescopingMultiHeadAttention.
     window_size: sliding-window size; only used for the swa types.
+    telescoping_kwargs: schedule and mode settings (fmap, cache_size,
+        weight_mode, position_mode, ...); only used for the telescoping types.
 
     Remaining args/kwargs are forwarded to the class constructor (see
     MultiHeadAttention for the shared signature).
@@ -1122,7 +1136,16 @@ def get_attention(
         return SlidingWindowMultiHeadAttention(
             *args, sliding_window=window_size, **kwargs
         )
+    if attn_type in ("tele", "telescoping"):
+        # local import to avoid a circular dependency at module load
+        from fms.modules.telescoping_attention import (
+            TelescopingMultiHeadAttention,
+        )
+
+        return TelescopingMultiHeadAttention(
+            *args, **(telescoping_kwargs or {}), **kwargs
+        )
     raise ValueError(
         f"Unknown attention type `{attn_type}`; expected one of "
-        "'attn', 'full_attention', 'swa', 'sliding_window'"
+        f"{_ATTENTION_TYPES}"
     )

@@ -8,7 +8,7 @@ callers.
 
 import functools
 import inspect
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 import torch
 
@@ -33,32 +33,144 @@ if flex_attention_available:
     except ImportError:
         pass
 
-_flex_attention_fn: Optional[Callable] = None
+# torch's flex_attention lowering rejects head dims below 16:
+#   "NYI: embedding dimension of the query, key, and value must be at least 16"
+FLEX_MIN_HEADDIM = 16
+
+# Block-sparse callers (telescoping) make a fresh shape per schedule under
+# dynamic=False; past dynamo's default limit of 8 it falls back to an unfused
+# eager path that materializes the full scores matrix and OOMs at large N.
+if flex_attention_available:
+    torch._dynamo.config.recompile_limit = max(
+        getattr(torch._dynamo.config, "recompile_limit", 0), 64
+    )
+
+# One compiled flex per `dynamic` setting: dynamic=True for shape-stable
+# callers, dynamic=False where every schedule is its own shape anyway.
+_compiled_flex_attention: dict = {}
+# (device_type, head_dim_qk, head_dim_v) signatures inductor cannot lower --
+# e.g. head dims below 16 ("NYI: embedding dimension ... must be at least 16").
+# Whether a shape compiles is a property of the shape, not of the process, so
+# this must be remembered per signature: a single global compiled/eager flag
+# makes the backend depend on whichever shape happened to run first.
+_eager_only_signatures: set = set()
 
 
-def call_flex_attention(*args, **kwargs):
-    """Call flex_attention through torch.compile (compiled lazily, once).
+def _flex_signature(query: torch.Tensor, value: torch.Tensor) -> tuple:
+    return (query.device.type, query.shape[-1], value.shape[-1])
+
+
+def _compiled_flex(dynamic: bool) -> Callable:
+    if dynamic not in _compiled_flex_attention:
+        _compiled_flex_attention[dynamic] = torch.compile(
+            flex_attention, dynamic=dynamic
+        )
+    return _compiled_flex_attention[dynamic]
+
+
+def _must_run_eager(signature: tuple) -> bool:
+    """CPU, or a shape inductor has already refused to lower. See
+    call_flex_attention for why CPU is never compiled here."""
+    return signature[0] == "cpu" or signature in _eager_only_signatures
+
+
+def call_flex_attention(query, key, value, *, dynamic: bool = True, **kwargs):
+    """Call flex_attention through torch.compile where that is both available
+    and correct, else eager.
+
     Eager flex_attention materializes the full score matrix, so compilation is
-    what actually delivers the fused sparse kernel; if compilation is
-    unavailable in this environment, fall back to eager.
+    what actually delivers the fused sparse kernel. Two cases force eager:
 
-    The eager fallback is only cached when eager actually succeeds: a genuine
-    caller bug (bad shapes, invalid block mask) raises from both paths and must
-    not permanently poison the backend selection for later, fixed callers."""
-    global _flex_attention_fn
-    if _flex_attention_fn is None:
-        compiled = torch.compile(flex_attention)
-        try:
-            result = compiled(*args, **kwargs)
-        except Exception:
-            # Retry in eager to distinguish a compilation failure from a real
-            # invocation bug; if eager also raises, propagate without caching.
-            result = flex_attention(*args, **kwargs)
-            _flex_attention_fn = flex_attention
-            return result
-        _flex_attention_fn = compiled
+    * CPU. The CPU inductor lowering returns all-NaN for a mask_mod that
+      captures a tensor (as composed user masks do) instead of failing, so the
+      compiled path there is not trustworthy. CPU is not a throughput path.
+    * Signatures inductor refuses to lower (head dim < 16). These fall back on
+      first use and are remembered, so the choice is per shape rather than a
+      process-wide flag set by whichever shape ran first.
+
+    A genuine caller bug (bad shapes, invalid block mask) raises from eager too
+    and is propagated without being recorded, so it cannot poison the backend
+    selection for later, fixed callers."""
+    signature = _flex_signature(query, value)
+    if _must_run_eager(signature):
+        return flex_attention(query, key, value, **kwargs)
+    try:
+        return _compiled_flex(dynamic)(query, key, value, **kwargs)
+    except Exception:
+        # Retry eagerly to tell a lowering failure from a real invocation bug;
+        # if eager also raises, propagate and record nothing.
+        result = flex_attention(query, key, value, **kwargs)
+        _eager_only_signatures.add(signature)
         return result
-    return _flex_attention_fn(*args, **kwargs)
+
+
+# enable_gqa lets the kernel broadcast Hkv heads over the query heads instead
+# of materializing the expansion: bit-identical, and `expansion` times less KV.
+_GQA_FALLBACK_BLOCK_M = 64
+_gqa_needs_pin: dict = {}
+
+
+def _gqa_key(q, k, v) -> tuple:
+    return (q.shape[1], q.shape[2], q.shape[3],
+            k.shape[1], k.shape[2], v.shape[3], q.dtype)
+
+
+def flex_attention_gqa(query, key, value, **kwargs):
+    """flex_attention with native GQA: query may carry more heads than key and
+    value, and the kernel broadcasts rather than materializing the expansion.
+
+    Compiled with dynamic=False -- block-sparse callers give every schedule its
+    own shape, so there is nothing for dynamic shapes to reuse.
+
+    Where enable_gqa leaves inductor no autotune choice, retry with a pinned
+    BLOCK_M. The failing window depends on (Q_LEN, head dim, ratio), so it is
+    discovered per shape; pinning globally costs 3x on the Q_LEN=1 decode
+    shape. Any other lowering failure falls back to eager exactly as
+    call_flex_attention does."""
+    kwargs = {**kwargs, "enable_gqa": True}
+    signature = _flex_signature(query, value)
+    if _must_run_eager(signature):
+        return flex_attention(query, key, value, **kwargs)
+
+    gqa_signature = _gqa_key(query, key, value)
+    pinned = {"kernel_options": {"BLOCK_M": _GQA_FALLBACK_BLOCK_M}}
+    if _gqa_needs_pin.get(gqa_signature):
+        kwargs = {**kwargs, **pinned}
+    try:
+        return _compiled_flex(False)(query, key, value, **kwargs)
+    except Exception as exc:
+        if "NoValidChoicesError" in str(exc) and not _gqa_needs_pin.get(
+            gqa_signature
+        ):
+            _gqa_needs_pin[gqa_signature] = True
+            return _compiled_flex(False)(query, key, value, **kwargs, **pinned)
+        result = flex_attention(query, key, value, **kwargs)
+        _eager_only_signatures.add(signature)
+        return result
+
+
+def pad_head_dims(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    head_dim_qk: int,
+    head_dim_v: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    """Zero-pad the feature dim up to flex's minimum head dim.
+    -> (query, key, value, qk_pad, v_pad).
+
+    Exact: padded lanes contribute 0 to every q.k. Callers must pin the scale
+    to the TRUE head dim, and apply positional encoding BEFORE this --
+    rotate-half splits at D/2 and would otherwise mix real lanes with pad
+    lanes."""
+    qk_pad = max(0, FLEX_MIN_HEADDIM - head_dim_qk)
+    v_pad = max(0, FLEX_MIN_HEADDIM - head_dim_v)
+    if qk_pad:
+        query = torch.nn.functional.pad(query, (0, qk_pad))
+        key = torch.nn.functional.pad(key, (0, qk_pad))
+    if v_pad:
+        value = torch.nn.functional.pad(value, (0, v_pad))
+    return query, key, value, qk_pad, v_pad
 
 
 def sliding_window_mask_mod(offset: int, window_size: int) -> Callable:

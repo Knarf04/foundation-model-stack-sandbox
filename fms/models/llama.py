@@ -64,35 +64,46 @@ class LLaMAConfig(ModelConfig):
     # list of layer ids of that type, plus optional per-type overrides:
     # num_heads, num_kv_heads, rope_theta, rope_scaling, sinks (learned
     # per-head attention sinks, default False); window_size (swa only,
-    # default 512). Layers listed in neither dict get full attention with the
-    # global config. Example:
+    # default 512); fmap / cache_size / weight_mode / position_mode /
+    # relative_dim / use_kv_short_conv / kv_conv_kernel_size / softcap (tele
+    # only, see TelescopingMultiHeadAttention). Layers listed in no dict get
+    # full attention with the global config. Example:
     #   attn={"layers": [4, 12], "num_heads": 16, "rope_theta": 500000.0}
     #   swa={"layers": [0, 1, 2, 3], "window_size": 512, "sinks": True}
+    #   tele={"layers": [5, 6], "cache_size": 512, "fmap": {1: 64, 2: 72, 3: 80}}
     attn: Optional[Mapping[str, Any]] = None
     swa: Optional[Mapping[str, Any]] = None
+    tele: Optional[Mapping[str, Any]] = None
+
+
+# Per-layer attention dicts, in the order a layer id is matched against them.
+_LAYER_ATTN_TYPES = ("swa", "tele", "attn")
 
 
 def _resolve_layer_attn(
     config: LLaMAConfig, layer_idx: int
 ) -> Tuple[str, Mapping[str, Any]]:
-    """fla-style per-layer attention selection: pick ("swa", config.swa) or
-    ("attn", config.attn) when layer_idx is listed in that dict's "layers";
-    default to full attention with the global config otherwise."""
-    in_attn = config.attn is not None and layer_idx in config.attn["layers"]
-    in_swa = config.swa is not None and layer_idx in config.swa["layers"]
-    if in_attn and in_swa:
-        raise ValueError(
-            f"layer {layer_idx} is listed in both attn['layers'] and swa['layers']"
-        )
-    if in_swa:
-        return "swa", config.swa
-    if in_attn:
-        return "attn", config.attn
+    """fla-style per-layer attention selection: pick ("swa", config.swa),
+    ("tele", config.tele) or ("attn", config.attn) when layer_idx is listed in
+    that dict's "layers"; default to full attention with the global config
+    otherwise."""
+    listed = [
+        name
+        for name in _LAYER_ATTN_TYPES
+        if getattr(config, name) is not None
+        and layer_idx in getattr(config, name)["layers"]
+    ]
+    if len(listed) > 1:
+        names = " and ".join(f"{n}['layers']" for n in listed)
+        raise ValueError(f"layer {layer_idx} is listed in both {names}")
+    if listed:
+        return listed[0], getattr(config, listed[0])
     return "attn", {}
 
 
 def _validate_layer_attn_cfgs(config: LLaMAConfig) -> None:
-    for name, cfg in (("attn", config.attn), ("swa", config.swa)):
+    for name in _LAYER_ATTN_TYPES:
+        cfg = getattr(config, name)
         if cfg is None:
             continue
         if "layers" not in cfg:
@@ -129,6 +140,35 @@ def _validate_layer_attn_cfgs(config: LLaMAConfig) -> None:
                 f"config.{name}: num_heads={nheads} is not divisible by "
                 f"num_kv_heads={kvheads}"
             )
+
+
+def _telescoping_kwargs(
+    config: LLaMAConfig, attn_cfg: Mapping[str, Any]
+) -> dict:
+    """Telescoping settings for one layer, from its `tele` dict with the
+    global config as fallback. rope_theta is shared with the other layer types;
+    the rest are telescoping-specific."""
+    position_mode = attn_cfg.get("position_mode", "rope")
+    if position_mode == "rope" and attn_cfg.get(
+        "rope_scaling", config.rope_scaling
+    ):
+        # rope_tables takes a base, not a scaling schedule; silently dropping
+        # it would give these layers a different RoPE than the config asks for.
+        raise ValueError(
+            "telescoping layers do not support rope_scaling with "
+            "position_mode='rope'; drop the scaling or set position_mode"
+        )
+    return dict(
+        fmap=attn_cfg.get("fmap", None),
+        cache_size=attn_cfg.get("cache_size", 512),
+        softcap=attn_cfg.get("softcap", 20.0),
+        weight_mode=attn_cfg.get("weight_mode", "qk"),
+        position_mode=position_mode,
+        rope_theta=attn_cfg.get("rope_theta", config.rope_theta),
+        relative_dim=attn_cfg.get("relative_dim", 8),
+        use_kv_short_conv=attn_cfg.get("use_kv_short_conv", False),
+        kv_conv_kernel_size=attn_cfg.get("kv_conv_kernel_size", 4),
+    )
 
 
 class LLaMABlock(nn.Module):
@@ -175,6 +215,18 @@ class LLaMABlock(nn.Module):
                 f"nheads={nheads} is not divisible by kvheads={kvheads}"
             )
 
+        telescoping_kwargs = None
+        position_encoder = rotary_emb
+        if attn_type in ("tele", "telescoping"):
+            telescoping_kwargs = _telescoping_kwargs(self.config, attn_cfg)
+            if telescoping_kwargs["position_mode"] != "none":
+                # Telescoping positions entries AFTER summarization (a summary
+                # sits at its interval's right endpoint), so the ordinary
+                # pre-cache RoPE must not also run -- it would rotate the keys
+                # a second time. position_mode="none" is the one case that
+                # defers to the shared RotaryEmbedding.
+                position_encoder = None
+
         self.attn = get_attention(
             attn_type,
             self.config.emb_dim,
@@ -184,10 +236,11 @@ class LLaMABlock(nn.Module):
             kvheads,
             p_dropout=self.config.p_dropout,
             use_bias=self.config.attn_bias,
-            position_encoder=rotary_emb,
+            position_encoder=position_encoder,
             fused=self.config.fused_weights,
             linear_config=self.config.linear_config,
             window_size=attn_cfg.get("window_size", 512),
+            telescoping_kwargs=telescoping_kwargs,
             use_sinks=attn_cfg.get("sinks", False),
         )
         self.ff_sub_layer = GatedLinearUnit(
