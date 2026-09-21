@@ -44,6 +44,7 @@ from fms.modules.flex_utils import (
     FLEX_MIN_HEADDIM,
     flex_attention_available as _flex_available,
     flex_attention_gqa,
+    normalize_attention_mask,
     pad_head_dims,
 )
 from fms.modules.linear import get_linear, get_linear_type
@@ -359,10 +360,12 @@ def telescope_flex_forward(
 # ---------------------------------------------------------------------------
 
 
-def _decode_slot_metadata(state: DecodeState, t: int, validate: bool = False):
+def _decode_slot_metadata(state: DecodeState, t: int, validate: bool = False,
+                          row: Optional[int] = None):
     """Per-slot visibility / node index for query t, plus the gather-order
     entry list. Small (sum(caps) elements), rebuilt each step because the
-    live set moves with t."""
+    live set moves with t. `row` only labels errors; the tensors are shared
+    across rows that sit at the same t."""
     device = state.k.device
     S = state.k.shape[1]
     spec = state.spec(t + 1)
@@ -401,9 +404,59 @@ def _decode_slot_metadata(state: DecodeState, t: int, validate: bool = False):
         ent_slot.append(slots)
 
     if not ent_j:
-        raise RuntimeError(f"query {t} has no visible entries")
+        where = "" if row is None else f" (row {row})"
+        raise RuntimeError(f"query {t} has no visible entries{where}")
     return (visible, slot_node, slot_level, torch.cat(ent_level),
             torch.cat(ent_j), torch.cat(ent_slot), bounds)
+
+
+def _decode_metadata_batched(state: DecodeState, t_rows):
+    """Every row's per-slot visibility and node index, in a fixed number of
+    tensor ops -- independent of the batch size and of how many distinct
+    positions it holds.
+
+    The per-row loop this replaces was O(distinct positions) small kernel
+    launches on a dispatch-bound path. Two facts make the batched form
+    possible: `level_row_bounds` is the branch-free closed form and already
+    runs on tensors (that is what TORCH_OPS is for), and the slot -> node map
+    inverts without a branch -- slot s at level l holds the node congruent to
+    its ring index mod cap[l], and the live range is never longer than the
+    ring, so `lo + (ring - lo) % cap` is the only candidate.
+
+    -> (visible [B, S] bool, slot_node [B, S], slot_level [S],
+        lo [B, L+1], hi [B, L+1])
+    """
+    dev = state.k.device
+    slot_level, slot_ring, cap_of_slot = state.slot_maps()
+    t_vec = torch.as_tensor(list(t_rows), device=dev, dtype=torch.long)
+    bounds = level_row_bounds(
+        t_vec, state.activation_times, state.cache_size, TORCH_OPS)
+    lo = torch.stack([p[0] for p in bounds], dim=1)          # [B, L+1]
+    hi = torch.stack([p[1] for p in bounds], dim=1)
+    lo_s = lo[:, slot_level]                                 # [B, S]
+    hi_s = hi[:, slot_level]
+    node = lo_s + torch.remainder(slot_ring - lo_s, cap_of_slot)
+    visible = node < hi_s
+    # A stale slot still yields a congruent node index; zero it so downstream
+    # index arithmetic (RoPE table lookup) stays in range. Those lanes are
+    # masked out of the softmax anyway.
+    return visible, torch.where(visible, node, torch.zeros_like(node)), \
+        slot_level, lo, hi
+
+
+def _batched_bin_distances(node, slot_level, lo, hi, visible):
+    """`base[l] - (j - lo_l)` for every slot of every row, vectorized.
+
+    The visible levels partition the past in order (coarse is older), so an
+    entry's rank is its offset within its level plus everything coarser.
+    """
+    counts = (hi - lo).clamp(min=0)                          # [B, L+1]
+    total = counts.sum(dim=1, keepdim=True)
+    # entries strictly coarser than each level = suffix sum, exclusive
+    coarser = counts.flip(1).cumsum(1).flip(1) - counts
+    base = total - 1 - coarser                               # [B, L+1]
+    dist = base[:, slot_level] - (node - lo[:, slot_level])
+    return torch.where(visible, dist, torch.zeros_like(dist))
 
 
 def _decode_bin_distances(ent_level, ent_j, bounds):
@@ -451,7 +504,7 @@ def telescope_flex_decode(
                            relative_states, relative_proj)
     if q_t.dim() != 4 or q_t.shape[1] != 1:
         raise ValueError(f"q_t must be [B, 1, Hq, Dk], got {tuple(q_t.shape)}")
-    if state.t < 1:
+    if min(state.t) < 1:
         raise ValueError("no token has been consumed yet")
 
     B, _, Hq, Dk = q_t.shape
@@ -465,16 +518,27 @@ def telescope_flex_decode(
         raise ValueError(f"Hq={Hq} must be divisible by Hkv={Hkv}.")
     expansion = Hq // Hkv
     device = q_t.device
-    t = state.t - 1
+    uniform = state.uniform_t
+    t_rows = [x - 1 for x in state.t]
+    t = (uniform - 1) if uniform is not None else max(t_rows)
 
-    visible, slot_node, slot_level, ent_level, ent_j, ent_slot, bounds = (
-        _decode_slot_metadata(state, t))
+    # All rows' per-slot visibility and node index in a fixed number of tensor
+    # ops, whatever the batch holds. `slot_level` comes back as the static
+    # [S] map; visible / slot_node are [B, S].
+    visible, slot_node, slot_level, bnd_lo, bnd_hi = _decode_metadata_batched(
+        state, t_rows)
 
-    # `bounds` are host ints, so the entry list and its RoPE positions are
-    # built without touching device memory. Reading them off the tensors
-    # instead would force a device->host sync on EVERY decode step.
     stats = None
     if return_stats:
+        # Debug aid only: it wants the entries in gather order, which is the
+        # one thing the per-slot form does not give. Host ints throughout, so
+        # no device->host sync on the normal path.
+        if uniform is None:
+            raise ValueError(
+                "return_stats is a single-position debug aid; it has no "
+                "meaning for rows at different positions"
+            )
+        _, _, _, ent_level, ent_j, _, bounds = _decode_slot_metadata(state, t)
         entries = [(lv, j) for lv, (lo, hi) in enumerate(bounds)
                    for j in range(lo, hi)]
         stats = {"entries": entries, "positions": [], "distances": []}
@@ -490,25 +554,33 @@ def telescope_flex_decode(
         if return_stats:
             stats["positions"] = [((j + 1) << lv) - 1
                                   for lv, j in stats["entries"]]
-        q_bhnd = apply_rope(
-            q_bhnd, torch.full((1, 1, 1), t, device=device, dtype=torch.long),
-            rope_cos, rope_sin)
-        k_bhsd = apply_rope(k_bhsd, slot_pos[None, None, :], rope_cos, rope_sin)
+        if uniform is not None:
+            q_pos = torch.full((1, 1, 1), t, device=device, dtype=torch.long)
+        else:
+            q_pos = torch.as_tensor(
+                t_rows, device=device, dtype=torch.long)[:, None, None]
+        k_pos = slot_pos[:, None, :]                           # [B, 1, S]
+        q_bhnd = apply_rope(q_bhnd, q_pos, rope_cos, rope_sin)
+        k_bhsd = apply_rope(k_bhsd, k_pos, rope_cos, rope_sin)
     elif position_mode == "relative":
-        ent_dist = _decode_bin_distances(ent_level, ent_j, bounds)
-        if return_stats:
-            # The only remaining sync, and only when stats are requested.
-            stats["distances"] = ent_dist.tolist()
         rel_logits = torch.einsum(
             "bnhd,dr->bnhr",
             relative_states.float(), relative_proj.float(),
         )                                              # [B, 1, Hq, bins]
         max_bins = rel_logits.shape[-1]
-        slot_dist = torch.zeros(S, dtype=torch.long, device=device)
-        slot_dist[ent_slot] = ent_dist
-        # [B, Hq, S]: the single query row's bias for every slot.
-        rel_bias = rel_logits[:, 0].permute(0, 1, 2)[
-            ..., slot_dist.clamp(0, max_bins - 1)]
+
+        slot_dist = _batched_bin_distances(          # [B, S]
+            slot_node, slot_level, bnd_lo, bnd_hi, visible)
+        if return_stats:
+            # The only remaining sync, and only when stats are requested.
+            stats["distances"] = _decode_bin_distances(
+                ent_level, ent_j, bounds).tolist()
+        idx = slot_dist.clamp(0, max_bins - 1)
+        # each row gathers its own bins out of its own logits
+        rel_bias = torch.gather(
+            rel_logits[:, 0], 2,
+            idx[:, None, :].expand(-1, rel_logits.shape[2], -1),
+        )                                              # [B, Hq, S]
 
     q_bhnd, k_bhsd, v_bhsd, dk_pad, dv_pad = pad_head_dims(
         q_bhnd, k_bhsd, v_bhsd, Dk, Dv)
@@ -525,7 +597,7 @@ def telescope_flex_decode(
         # masked_fill takes the sentinel as a kernel argument; building a
         # `torch.tensor(-inf, device=...)` here would stage it on the host and
         # copy H2D on every step, which also blocks CUDA graph capture.
-        return s.masked_fill(~visible[kv_i], float("-inf"))
+        return s.masked_fill(~visible[b, kv_i], float("-inf"))
 
     out, lse = flex_attention_gqa(
         q_bhnd, k_bhsd, v_bhsd, score_mod=score_mod, scale=Dk ** -0.5,
@@ -784,20 +856,23 @@ class TelescopingMultiHeadAttention(MultiHeadAttention):
                 "TelescopingMultiHeadAttention only supports the telescoping "
                 f"attention path, got attn_name=`{attn_name}`"
             )
-        if attn_kwargs.get("mask", None) is not None:
-            # The schedule alone decides what a query sees, and a summary
-            # already mixes the tokens under it, so a padding/packing mask has
-            # nowhere to apply. Refusing is the honest answer: silently
-            # dropping it would let padded or packed batches train on
-            # cross-document context.
-            raise NotImplementedError(
-                "telescoping attention does not support a user attention "
-                "mask: summaries merge tokens before the mask could apply, so "
-                "padding and packed-example boundaries are not yet handled. "
-                "Use unpadded, single-document sequences."
-            )
-
         batch_size, q_len, _ = q.size()
+
+        # A padding mask is handled by REALIGNING, not by masking: gather each
+        # row's real tokens to the front so real token i sits at absolute
+        # position i. The dyadic tree is anchored at position 0, so this is
+        # what makes the result independent of how much padding a row carries
+        # -- left padding would otherwise regroup every token into different
+        # summaries. Trailing pad positions then need no masking at all: a node
+        # is first attendable at a query at or after its own last covered
+        # token (a[l] >= 2^l - 1), so a node straddling the real/pad boundary
+        # is only ever visible to a pad query, whose output is discarded.
+        order, n_real = self._padding_order(
+            attn_kwargs.get("mask", None), batch_size, q_len
+        )
+        if order is not None:
+            q = self._gather_rows(q, order)
+
         # The ORIGINAL pre-projection hidden state: merge weights, relative
         # states and the gate all read it, not the projected Q.
         x = q
@@ -805,7 +880,7 @@ class TelescopingMultiHeadAttention(MultiHeadAttention):
 
         if past_key_value_state is None:
             out, lse, state = self._prefill(
-                x, queries, keys, values, use_cache=use_cache
+                x, queries, keys, values, use_cache=use_cache, n_real=n_real
             )
         else:
             if not isinstance(past_key_value_state, DecodeState):
@@ -820,9 +895,69 @@ class TelescopingMultiHeadAttention(MultiHeadAttention):
             )
 
         dense_out = self._finish(out, lse, x, batch_size, q_len)
+        if order is not None:
+            dense_out = self._scatter_rows(dense_out, order)
         return (dense_out, state) if use_cache else dense_out
 
-    def _prefill(self, x, queries, keys, values, use_cache: bool):
+    # ---- padding realignment -------------------------------------------
+
+    def _padding_order(self, mask, batch_size: int, q_len: int):
+        """
+        -> (order, n_real): `order` is [B, q_len] long, listing each row's real
+        token positions in order followed by its pad positions, or None when
+        there is nothing to realign. `n_real` is the per-row real length.
+
+        Only padding masks are accepted. A packing mask (one that varies with
+        the query beyond causality) has no realignment that makes it go away,
+        and quietly treating it as padding would train on cross-document
+        context, so it is rejected.
+        """
+        if mask is None:
+            return None, None
+        if mask.dtype != torch.bool:
+            raise NotImplementedError(
+                "telescoping attention takes a boolean padding mask; an "
+                "additive float mask has no meaning for a summary, whose "
+                "tokens may carry different biases. Pass True = attend."
+            )
+        mask = normalize_attention_mask(mask, batch_size, q_len, q_len)
+
+        # Per-token validity, read off the newest query row -- the last query
+        # is real whenever anything is.
+        valid = mask[:, -1, :]
+        causal = torch.ones(q_len, q_len, dtype=torch.bool,
+                            device=mask.device).tril()
+        expected = valid[:, None, :] & causal[None] & valid[:, :, None]
+        if not torch.equal(mask & causal[None], expected):
+            raise NotImplementedError(
+                "telescoping attention supports padding masks only; this mask "
+                "varies with the query beyond causality (packing / document "
+                "boundaries), which realignment cannot express. A node spans "
+                "a fixed dyadic interval, so a boundary inside one cannot be "
+                "masked away after the merge."
+            )
+        n_real = valid.sum(dim=1)
+        if bool((n_real == q_len).all()):
+            return None, None                       # nothing padded
+        if bool((n_real == 0).any()):
+            raise ValueError("every row must contain at least one real token")
+        # Stable argsort puts the real positions first, in order, pads after.
+        order = torch.argsort(
+            (~valid).to(torch.int8), dim=1, stable=True
+        )
+        return order, n_real
+
+    @staticmethod
+    def _gather_rows(t: Tensor, order: Tensor) -> Tensor:
+        return t.gather(1, order[..., None].expand(-1, -1, t.shape[-1]))
+
+    @staticmethod
+    def _scatter_rows(t: Tensor, order: Tensor) -> Tensor:
+        out = torch.empty_like(t)
+        out.scatter_(1, order[..., None].expand(-1, -1, t.shape[-1]), t)
+        return out
+
+    def _prefill(self, x, queries, keys, values, use_cache: bool, n_real=None):
         """Build the tree over the whole sequence and attend to it."""
         q_len = queries.shape[1]
         weight_kwargs = (
@@ -849,6 +984,11 @@ class TelescopingMultiHeadAttention(MultiHeadAttention):
 
         state = None
         if use_cache:
+            # Hand off as of the last REAL token, not the last padded slot.
+            # The tree is prefix-stable -- node j of level l depends only on
+            # tokens below (j+1) * 2^l -- so the first `R >> l` nodes of a
+            # padded row's tree ARE the tree of its length-R prefix.
+            real_lens = None if n_real is None else [int(n) for n in n_real]
             conv_kwargs = {}
             if self.use_kv_short_conv:
                 # init_decode_state wants the RAW pre-conv rows: the ring cache
@@ -864,6 +1004,7 @@ class TelescopingMultiHeadAttention(MultiHeadAttention):
                 w_levels,
                 self.fmap,
                 self.cache_size,
+                real_lens=real_lens,
                 **conv_kwargs,
             )
         return out, lse, state
@@ -896,7 +1037,8 @@ class TelescopingMultiHeadAttention(MultiHeadAttention):
                 softcap=self.softcap,
                 position_mode=self.position_mode,
                 return_stats=False,
-                **self._position_kwargs(x_t, state.t),
+                # the table must cover the furthest-along row
+                **self._position_kwargs(x_t, max(state.t)),
             )
             outs.append(out_t)
             lses.append(lse_t)

@@ -62,8 +62,10 @@ class LLaMAConfig(ModelConfig):
     fused_weights: bool = True
     # fla-style per-layer attention selection. Each dict must carry a "layers"
     # list of layer ids of that type, plus optional per-type overrides:
-    # num_heads, num_kv_heads, rope_theta, rope_scaling, sinks (learned
-    # per-head attention sinks, default False); window_size (swa only,
+    # num_heads, num_kv_heads, rope_theta, rope_scaling, rope (False drops
+    # positional encoding on those layers entirely -- a NoPE layer -- default
+    # True), sinks (learned per-head attention sinks, default False);
+    # window_size (swa only,
     # default 512); fmap / cache_size / weight_mode / position_mode /
     # relative_dim / use_kv_short_conv / kv_conv_kernel_size / softcap (tele
     # only, see TelescopingMultiHeadAttention). Layers listed in no dict get
@@ -128,6 +130,11 @@ def _validate_layer_attn_cfgs(config: LLaMAConfig) -> None:
             raise ValueError(
                 f"config.{name}: emb_dim={config.emb_dim} is not divisible by "
                 f"num_heads={nheads}"
+            )
+        if not isinstance(cfg.get("rope", True), bool):
+            raise ValueError(
+                f"config.{name}['rope'] must be a bool (False = no positional "
+                f"encoding on those layers), got {cfg['rope']!r}"
             )
         kvheads = cfg.get("num_kv_heads", config.kvheads)
         if not isinstance(kvheads, int) or kvheads < 0:
@@ -216,7 +223,10 @@ class LLaMABlock(nn.Module):
             )
 
         telescoping_kwargs = None
-        position_encoder = rotary_emb
+        # "rope": False drops the shared pre-cache RotaryEmbedding for this
+        # layer (a NoPE layer). Independent of layer type; telescoping may
+        # additionally force it off below when it positions after the tree.
+        position_encoder = rotary_emb if attn_cfg.get("rope", True) else None
         if attn_type in ("tele", "telescoping"):
             telescoping_kwargs = _telescoping_kwargs(self.config, attn_cfg)
             if telescoping_kwargs["position_mode"] != "none":

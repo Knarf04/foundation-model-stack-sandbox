@@ -1,7 +1,7 @@
 """Incremental decode state: per-level rings, capacities, tree update."""
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -31,10 +31,19 @@ class DecodeState:
         v [B, sum(caps), Hkv, Dv]
         w [B, sum(caps), Hkv, 1]    merge log-weights
         conv_k / conv_v [B, K-1, Hkv*D] | None   last K-1 PRE-conv flat rows
-        t                           tokens consumed == next query index
+        t               [B] host ints, tokens consumed per row == that row's
+                        next query index
 
     Node j of level l lives at ring_slot(state, l, j). Keys are unrotated
     because the merge re-reads them and RoPE rotates after aggregation.
+
+    `t` is per row so a batch of prompts of differing length can decode
+    together, and it is deliberately HOST state (plain ints, not a device
+    tensor): every step reads it to pick ring slots, and a device tensor would
+    force a sync. Rows advance in lockstep -- one step consumes one token
+    everywhere -- so the values stay offset by their prompt lengths. When they
+    are all equal, `uniform_t` lets the hot paths take the cheaper
+    single-index route.
     """
 
     k: torch.Tensor
@@ -42,18 +51,58 @@ class DecodeState:
     w: torch.Tensor
     conv_k: Optional[torch.Tensor]
     conv_v: Optional[torch.Tensor]
-    t: int
+    t: Tuple[int, ...]
     activation_times: Tuple[int, ...]
     cache_size: int
     caps: Tuple[int, ...]
     ring_offsets: Tuple[int, ...]
 
+    def __post_init__(self):
+        if isinstance(self.t, int):            # accept a scalar, store per row
+            self.t = (self.t,) * self.k.shape[0]
+        else:
+            self.t = tuple(int(x) for x in self.t)
+        if len(self.t) != self.k.shape[0]:
+            raise ValueError(
+                f"t has {len(self.t)} entries for a batch of {self.k.shape[0]}"
+            )
+
     @property
     def num_levels(self) -> int:
         return len(self.activation_times)
 
+    def slot_maps(self):
+        """Static per-slot (level, ring index, capacity), built once.
+
+        The ring layout never changes, so these are constants of the schedule.
+        Having them lets a decode step recover "which node sits in slot s"
+        for every row at once, instead of scattering entry lists per row.
+        """
+        cached = getattr(self, "_slot_maps", None)
+        if cached is not None and cached[0].device == self.k.device:
+            return cached
+        dev = self.k.device
+        S = self.k.shape[1]
+        level = torch.zeros(S, dtype=torch.long, device=dev)
+        ring = torch.zeros(S, dtype=torch.long, device=dev)
+        for l, cap in enumerate(self.caps):
+            lo = self.ring_offsets[l]
+            level[lo:lo + cap] = l
+            ring[lo:lo + cap] = torch.arange(cap, device=dev)
+        cap_of = torch.as_tensor(self.caps, device=dev)[level]
+        maps = (level, ring, cap_of)
+        self._slot_maps = maps
+        return maps
+
+    @property
+    def uniform_t(self) -> Optional[int]:
+        """The shared token count when every row is at the same position,
+        else None. Host-side, so branching on it costs no sync."""
+        first = self.t[0]
+        return first if all(x == first for x in self.t) else None
+
     def spec(self, seq_len: int) -> RangeSpec:
-        """The prefill schedule truncated to `seq_len` tokens."""
+        """The prefill schedule truncated to `seq_len` tokens (one row's)."""
         return RangeSpec(self.activation_times, self.cache_size, seq_len)
 
 def decode_capacities(
@@ -118,11 +167,19 @@ def init_decode_state(
     k_pre_conv: Optional[torch.Tensor] = None,
     v_pre_conv: Optional[torch.Tensor] = None,
     conv_kernel_size: Optional[int] = None,
+    real_lens: Optional[Sequence[int]] = None,
 ) -> DecodeState:
     """
     Prefill -> decode hand-off: k/v/w_levels are build_dyadic_summaries' outputs
     for N tokens, and the state receives the nodes live at query N-1, t = N.
     Short-conv mode also takes the RAW pre-conv k/v and conv_kernel_size.
+
+    `real_lens` gives each row's true prefix length when the batch was padded;
+    the row is then handed off as of ITS last real token. This is sound
+    because the tree is prefix-stable -- node j of level l depends only on
+    tokens below (j+1) * 2^l -- so the first `R >> l` nodes of a padded row's
+    tree are exactly the tree of its length-R prefix. Defaults to all rows at
+    the full length N.
     """
     check_paired("k_pre_conv", k_pre_conv, "v_pre_conv", v_pre_conv)
     check_paired("k_pre_conv", k_pre_conv, "conv_kernel_size", conv_kernel_size)
@@ -153,24 +210,44 @@ def init_decode_state(
         caps=caps,
         ring_offsets=offsets,
     )
-    spec = RangeSpec(a, cache_size, N)
-    for level in range(L + 1):
-        lo, hi = range_bounds(spec, N - 1, level)
-        if lo == hi:
-            continue
-        if any(hi > lv[level].shape[1]
-               for lv in (k_levels, v_levels, w_levels)):
-            raise ValueError(
-                f"level {level}: live range [{lo},{hi}) exceeds the given "
-                f"level tensors"
+    lens = [N] * B if real_lens is None else [int(x) for x in real_lens]
+    if len(lens) != B:
+        raise ValueError(f"real_lens has {len(lens)} entries for batch {B}")
+    if min(lens) < 1 or max(lens) > N:
+        raise ValueError(f"real_lens must lie in [1, {N}], got {lens}")
+    state.t = tuple(lens)
+
+    dev = state.k.device
+    # Rows at the same length share a live range; the common (unpadded) case
+    # is a single group and reduces to the original whole-batch assignment.
+    for group_len in sorted(set(lens)):
+        rows = [b for b, x in enumerate(lens) if x == group_len]
+        whole = len(rows) == B
+        row_idx = None if whole else torch.as_tensor(rows, device=dev)[:, None]
+        spec = RangeSpec(a, cache_size, group_len)
+        for level in range(L + 1):
+            lo, hi = range_bounds(spec, group_len - 1, level)
+            if lo == hi:
+                continue
+            if any(hi > lv[level].shape[1]
+                   for lv in (k_levels, v_levels, w_levels)):
+                raise ValueError(
+                    f"level {level}: live range [{lo},{hi}) exceeds the given "
+                    f"level tensors"
+                )
+            slots = _ring_slots(
+                state, level,
+                torch.arange(lo, hi, device=dev, dtype=torch.long),
             )
-        slots = _ring_slots(
-            state, level,
-            torch.arange(lo, hi, device=state.k.device, dtype=torch.long),
-        )
-        state.k[:, slots] = k_levels[level][:, lo:hi]
-        state.v[:, slots] = v_levels[level][:, lo:hi]
-        state.w[:, slots] = w_levels[level][:, lo:hi]
+            if whole:
+                state.k[:, slots] = k_levels[level][:, lo:hi]
+                state.v[:, slots] = v_levels[level][:, lo:hi]
+                state.w[:, slots] = w_levels[level][:, lo:hi]
+            else:
+                sl = slots[None, :]
+                state.k[row_idx, sl] = k_levels[level][rows, lo:hi]
+                state.v[row_idx, sl] = v_levels[level][rows, lo:hi]
+                state.w[row_idx, sl] = w_levels[level][rows, lo:hi]
     if k_pre_conv is not None:
         if conv_kernel_size <= 0:
             raise ValueError(
@@ -181,13 +258,41 @@ def init_decode_state(
                 f"pre-conv rows must be [B={B}, N={N}, ...], got "
                 f"{tuple(k_pre_conv.shape)} / {tuple(v_pre_conv.shape)}"
             )
-        state.conv_k = conv_history(
-            k_pre_conv.reshape(B, N, -1), conv_kernel_size
-        )
-        state.conv_v = conv_history(
-            v_pre_conv.reshape(B, N, -1), conv_kernel_size
-        )
+        k_flat = k_pre_conv.reshape(B, N, -1)
+        v_flat = v_pre_conv.reshape(B, N, -1)
+        if len(set(lens)) == 1:
+            r = lens[0]
+            state.conv_k = conv_history(k_flat[:, :r], conv_kernel_size)
+            state.conv_v = conv_history(v_flat[:, :r], conv_kernel_size)
+        else:
+            # Each row's last K-1 PRE-conv rows end at its own real length.
+            state.conv_k = torch.stack([
+                conv_history(k_flat[b:b + 1, :r], conv_kernel_size)[0]
+                for b, r in enumerate(lens)])
+            state.conv_v = torch.stack([
+                conv_history(v_flat[b:b + 1, :r], conv_kernel_size)[0]
+                for b, r in enumerate(lens)])
     return state
+
+def _fired_level(activation_times: Tuple[int, ...], t: int) -> Optional[int]:
+    """The single level >= 1 that activates a node at token t, or None.
+
+    Dyadic alignment guarantees at most one; two would mean the schedule is
+    malformed, which is an assertion rather than a supported case.
+    """
+    fired = None
+    for level in range(1, len(activation_times)):
+        span = 1 << level
+        if t < activation_times[level] or (t - activation_times[level]) % span:
+            continue
+        if fired is not None:
+            raise AssertionError(
+                f"levels {fired} and {level} both activate at t={t}; the "
+                f"schedule is not dyadically aligned"
+            )
+        fired = level
+    return fired
+
 
 def advance_decode_state(
     state: DecodeState,
@@ -201,13 +306,15 @@ def advance_decode_state(
     v_conv_weight: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Consume token t = state.t in place; state.t becomes t + 1.
+    Consume each row's token t = state.t[b] in place; every t becomes t + 1.
     q_t/k_t/v_t: [B, 1, H*, D*] RAW projections. -> (k_t, v_t) as stored.
 
     Order matters: short conv -> merge weight -> the one level activating at t
     merges its two live children -> token t written at level 0, AFTER the merge.
     """
-    t = state.t
+    t_rows = state.t
+    uniform = state.uniform_t
+    t = uniform if uniform is not None else max(t_rows)
     B, _, Hkv, Dk = state.k.shape
     Dv = state.v.shape[-1]
     if q_t.dim() != 4 or q_t.shape[0] != B or q_t.shape[1] != 1 \
@@ -249,54 +356,85 @@ def advance_decode_state(
     else:
         w_t = compute_summary_weights(q_t, k_t)
 
-    # 3. ruler tick: at most one level >= 1 activates a node at t
+    # 3. ruler tick: at most one level >= 1 activates a node at each row's t.
+    # The whole decision is host-side (t is host state), so the per-row case
+    # costs integer work here and one extra gather/scatter below -- never an
+    # extra kernel launch: rows firing DIFFERENT levels still merge together,
+    # because a ring slot index is global across levels and merge_children is
+    # level-agnostic.
     a = state.activation_times
     L = len(a) - 1
-    fired = None
-    for level in range(1, L + 1):
-        span = 1 << level
-        if t < a[level] or (t - a[level]) % span != 0:
+    rows, c0s, c1s, parents = [], [], [], []
+    for b, t_b in enumerate(t_rows):
+        fired = _fired_level(a, t_b)
+        if fired is None:
             continue
-        if fired is not None:
-            raise AssertionError(
-                f"levels {fired} and {level} both activate at t={t}; the "
-                f"schedule is not dyadically aligned"
-            )
-        fired = level
-        j = (t - a[level]) >> level
-        # Both children leave level-1's range exactly at t, so they are live
-        # at t-1 (and t >= 1 here).
-        lo_c, hi_c = range_bounds(state.spec(t), t - 1, level - 1)
+        j = (t_b - a[fired]) >> fired
+        # Both children leave level-1's range exactly at t_b, so they are live
+        # at t_b - 1 (and t_b >= 1 here).
+        lo_c, hi_c = range_bounds(state.spec(t_b), t_b - 1, fired - 1)
         if not (lo_c <= 2 * j and 2 * j + 1 < hi_c):
             raise AssertionError(
-                f"children of node ({level}, {j}) not live at t-1={t - 1}: "
-                f"level-{level - 1} range [{lo_c},{hi_c})"
+                f"children of node ({fired}, {j}) not live at t-1={t_b - 1} "
+                f"(row {b}): level-{fired - 1} range [{lo_c},{hi_c})"
             )
-        c0 = ring_slot(state, level - 1, 2 * j)
-        c1 = ring_slot(state, level - 1, 2 * j + 1)
-        parent = ring_slot(state, level, j)
-        # child axis is dim 1 here: [B, 2, Hkv, D]
-        k_ch, v_ch, w_ch = (
-            torch.stack([t[:, c0], t[:, c1]], dim=1)
-            for t in (state.k, state.v, state.w)
-        )
-        (state.k[:, parent], state.v[:, parent],
-         state.w[:, parent]) = merge_children(k_ch, v_ch, w_ch, dim=1)
+        rows.append(b)
+        c0s.append(ring_slot(state, fired - 1, 2 * j))
+        c1s.append(ring_slot(state, fired - 1, 2 * j + 1))
+        parents.append(ring_slot(state, fired, j))
 
-    # capacity invariant at the new query; also validates the schedule
-    spec_next = state.spec(t + 1)
-    for level in range(L + 1):
-        lo, hi = range_bounds(spec_next, t, level)
-        if hi - lo > state.caps[level]:
-            raise AssertionError(
-                f"level {level} needs {hi - lo} live slots > cap "
-                f"{state.caps[level]} at t={t}"
+    if rows:
+        if uniform is not None:
+            # Every row fired the same level at the same node: basic indexing
+            # gives views and a strided write, no gather/scatter.
+            c0, c1, parent = c0s[0], c1s[0], parents[0]
+            k_ch, v_ch, w_ch = (
+                torch.stack([src[:, c0], src[:, c1]], dim=1)
+                for src in (state.k, state.v, state.w)
             )
+            (state.k[:, parent], state.v[:, parent],
+             state.w[:, parent]) = merge_children(k_ch, v_ch, w_ch, dim=1)
+        else:
+            dev = state.k.device
+            bi = torch.as_tensor(rows, device=dev)
+            c0v = torch.as_tensor(c0s, device=dev)
+            c1v = torch.as_tensor(c1s, device=dev)
+            pv = torch.as_tensor(parents, device=dev)
+            k_ch, v_ch, w_ch = (
+                torch.stack([src[bi, c0v], src[bi, c1v]], dim=1)
+                for src in (state.k, state.v, state.w)
+            )
+            k_p, v_p, w_p = merge_children(k_ch, v_ch, w_ch, dim=1)
+            # index_put_ will not downcast the way a basic-indexing assignment
+            # does, and merge_children returns fp32 (alpha is fp32).
+            state.k[bi, pv] = k_p.to(state.k.dtype)
+            state.v[bi, pv] = v_p.to(state.v.dtype)
+            state.w[bi, pv] = w_p.to(state.w.dtype)
 
-    # 4. token t at level 0, after the merge
-    slot0 = ring_slot(state, 0, t)
-    state.k[:, slot0] = k_t[:, 0]
-    state.v[:, slot0] = v_t[:, 0]
-    state.w[:, slot0] = w_t[:, 0]
-    state.t = t + 1
+    # capacity invariant at each row's new query; also validates the schedule
+    for t_b in set(t_rows):
+        spec_next = state.spec(t_b + 1)
+        for level in range(L + 1):
+            lo, hi = range_bounds(spec_next, t_b, level)
+            if hi - lo > state.caps[level]:
+                raise AssertionError(
+                    f"level {level} needs {hi - lo} live slots > cap "
+                    f"{state.caps[level]} at t={t_b}"
+                )
+
+    # 4. each row's token at its own level-0 slot, after the merge
+    if uniform is not None:
+        slot0 = ring_slot(state, 0, t)
+        state.k[:, slot0] = k_t[:, 0]
+        state.v[:, slot0] = v_t[:, 0]
+        state.w[:, slot0] = w_t[:, 0]
+    else:
+        dev = state.k.device
+        bi = torch.arange(B, device=dev)
+        s0 = torch.as_tensor(
+            [ring_slot(state, 0, t_b) for t_b in t_rows], device=dev)
+        state.k[bi, s0] = k_t[:, 0].to(state.k.dtype)
+        state.v[bi, s0] = v_t[:, 0].to(state.v.dtype)
+        state.w[bi, s0] = w_t[:, 0].to(state.w.dtype)
+    state.t = tuple(x + 1 for x in t_rows)
     return k_t, v_t

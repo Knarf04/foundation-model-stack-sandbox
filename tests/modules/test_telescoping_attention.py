@@ -125,7 +125,7 @@ class TelescopingForwardTests(unittest.TestCase):
         with torch.no_grad():
             _, cache = tele(torch.randn(1, 20, EMB), use_cache=True)
         self.assertIsInstance(cache, DecodeState)
-        self.assertEqual(cache.t, 20)
+        self.assertEqual(cache.t, (20,))   # per row
 
     def test_foreign_cache_rejected(self):
         """A (keys, values) cache from another attention type cannot be
@@ -206,6 +206,137 @@ class TelescopingForwardTests(unittest.TestCase):
             # a very negative sink removes the extra denominator entry again
             sunk.sinks.fill_(-30.0)
             torch.testing.assert_close(plain(x), sunk(x), atol=1e-5, rtol=1e-5)
+
+
+def _pad_mask(lens, total, device="cpu", left=True):
+    """FMS-convention bool mask for a left- (or right-) padded batch."""
+    valid = torch.zeros(len(lens), total, dtype=torch.bool, device=device)
+    for b, r in enumerate(lens):
+        if left:
+            valid[b, total - r:] = True
+        else:
+            valid[b, :r] = True
+    return (valid[:, None, :] & valid[:, :, None]).tril()
+
+
+@unittest.skipUnless(_flex_available, "flex_attention requires torch >= 2.5")
+class TelescopingPaddingTests(unittest.TestCase):
+    """A padding mask is handled by realigning each row's real tokens to the
+    front, not by masking: the dyadic tree is anchored at position 0, so left
+    padding would otherwise regroup every token into different summaries."""
+
+    def test_left_padding_matches_the_unpadded_run(self):
+        torch.manual_seed(0)
+        tele = _build()
+        real = torch.randn(1, 37, EMB)
+        with torch.no_grad():
+            gold = tele(real)
+            for pad in (3, 11, 27):
+                x = torch.cat([torch.randn(1, pad, EMB), real], dim=1)
+                got = tele(x, mask=_pad_mask([37], 37 + pad))[:, pad:]
+                torch.testing.assert_close(got, gold, atol=1e-6, rtol=1e-6)
+
+    def test_pad_content_cannot_leak(self):
+        """Same padded length, wildly different pad values -> bitwise equal.
+        A node straddling the real/pad boundary is only ever visible to a pad
+        query, because a node activates no earlier than its own last token."""
+        torch.manual_seed(0)
+        tele = _build()
+        real = torch.randn(1, 37, EMB)
+        mask = _pad_mask([37], 64)
+        outs = []
+        with torch.no_grad():
+            for scale in (1.0, 1000.0, 0.0):
+                x = torch.cat([torch.randn(1, 27, EMB) * scale, real], dim=1)
+                # only the real rows are claimed: the pad rows are garbage
+                # computed from garbage, and the loss masks them out
+                outs.append(tele(x, mask=mask)[:, 27:])
+        self.assertTrue(torch.equal(outs[0], outs[1]))
+        self.assertTrue(torch.equal(outs[0], outs[2]))
+
+    def test_float_mask_rejected(self):
+        tele = _build()
+        with self.assertRaises(NotImplementedError):
+            tele(torch.randn(1, 12, EMB), mask=torch.zeros(1, 12, 12))
+
+    def test_packing_mask_rejected(self):
+        """A mask that varies with the query beyond causality cannot be fixed
+        by realignment -- a boundary inside a dyadic node survives the merge."""
+        tele = _build()
+        blocks = torch.zeros(1, 24, 24, dtype=torch.bool)
+        blocks[:, :12, :12] = True
+        blocks[:, 12:, 12:] = True
+        with self.assertRaises(NotImplementedError):
+            tele(torch.randn(1, 24, EMB), mask=blocks.tril())
+
+    def test_cache_hands_off_at_the_real_length(self):
+        tele = _build()
+        real = torch.randn(1, 37, EMB)
+        x = torch.cat([torch.randn(1, 27, EMB), real], dim=1)
+        with torch.no_grad():
+            _, state = tele(x, mask=_pad_mask([37], 64), use_cache=True)
+        self.assertEqual(state.t, (37,))
+
+
+@unittest.skipUnless(_flex_available, "flex_attention requires torch >= 2.5")
+class TelescopingPerRowPositionTests(unittest.TestCase):
+    """DecodeState.t is per row, so prompts of differing length decode in one
+    batch. Rows at the same position share the uniform fast path."""
+
+    def test_uniform_batch_reports_one_position(self):
+        tele = _build()
+        with torch.no_grad():
+            _, state = tele(torch.randn(4, 20, EMB), use_cache=True)
+        self.assertEqual(state.t, (20,) * 4)
+        self.assertEqual(state.uniform_t, 20)
+
+    def test_ragged_batch_decodes_as_separate_rows(self):
+        lens = [37, 30, 22]
+        for mode in ("rope", "relative", "none"):
+            with self.subTest(position_mode=mode):
+                torch.manual_seed(5)
+                tele = _build(position_mode=mode)
+                reals = [torch.randn(1, r, EMB) for r in lens]
+                padded = torch.cat(
+                    [torch.cat([torch.randn(1, 40 - r, EMB), t], dim=1)
+                     for t, r in zip(reals, lens)], dim=0)
+                new = torch.randn(len(lens), 3, EMB)
+                with torch.no_grad():
+                    _, st = tele(padded, mask=_pad_mask(lens, 40), use_cache=True)
+                    self.assertEqual(st.t, tuple(lens))
+                    self.assertIsNone(st.uniform_t)
+                    got = []
+                    for i in range(3):
+                        row, st = tele(new[:, i:i + 1],
+                                       past_key_value_state=st, use_cache=True)
+                        got.append(row)
+                    got = torch.cat(got, dim=1)
+                    # each row decoded on its own, unpadded
+                    want = []
+                    for b, xr in enumerate(reals):
+                        _, s = tele(xr, use_cache=True)
+                        rows = []
+                        for i in range(3):
+                            o, s = tele(new[b:b + 1, i:i + 1],
+                                        past_key_value_state=s, use_cache=True)
+                            rows.append(o)
+                        want.append(torch.cat(rows, dim=1))
+                    want = torch.cat(want, dim=0)
+                self.assertEqual(st.t, tuple(x + 3 for x in lens))
+                torch.testing.assert_close(got, want, atol=1e-5, rtol=1e-5)
+
+    def test_rows_advance_independently(self):
+        tele = _build()
+        lens = [20, 14]
+        padded = torch.cat(
+            [torch.cat([torch.randn(1, 24 - r, EMB), torch.randn(1, r, EMB)], 1)
+             for r in lens], dim=0)
+        with torch.no_grad():
+            _, st = tele(padded, mask=_pad_mask(lens, 24), use_cache=True)
+            for _ in range(5):
+                _, st = tele(torch.randn(2, 1, EMB),
+                             past_key_value_state=st, use_cache=True)
+        self.assertEqual(st.t, (25, 19))     # offsets preserved, lockstep
 
 
 @unittest.skipUnless(
