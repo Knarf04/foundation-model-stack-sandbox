@@ -40,10 +40,19 @@ FLEX_MIN_HEADDIM = 16
 # Block-sparse callers (telescoping) make a fresh shape per schedule under
 # dynamic=False; past dynamo's default limit of 8 it falls back to an unfused
 # eager path that materializes the full scores matrix and OOMs at large N.
+# `recompile_limit` is the current name; torch < 2.8 calls it
+# `cache_size_limit`. The config module REJECTS assignment to a name it does
+# not know ("torch._dynamo.config.<x> does not exist"), and this module is
+# imported by fms.modules.attention, so a blind assignment would break the
+# import of every attention path on an older torch.
 if flex_attention_available:
-    torch._dynamo.config.recompile_limit = max(
-        getattr(torch._dynamo.config, "recompile_limit", 0), 64
-    )
+    for _limit_name in ("recompile_limit", "cache_size_limit"):
+        if hasattr(torch._dynamo.config, _limit_name):
+            setattr(
+                torch._dynamo.config,
+                _limit_name,
+                max(getattr(torch._dynamo.config, _limit_name), 64),
+            )
 
 # One compiled flex per `dynamic` setting: dynamic=True for shape-stable
 # callers, dynamic=False where every schedule is its own shape anyway.
