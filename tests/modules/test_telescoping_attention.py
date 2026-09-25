@@ -219,6 +219,68 @@ def _pad_mask(lens, total, device="cpu", left=True):
     return (valid[:, None, :] & valid[:, :, None]).tril()
 
 
+class ActivationScheduleTests(unittest.TestCase):
+    """The coarsest level has no parent, so it is constrained differently from
+    the levels below it."""
+
+    def test_coarsest_level_admits_phase_zero(self):
+        """a=(0,3,8): every query sees 2-3 tokens, 1-3 two-token summaries and
+        1-2 four-token summaries. a[2] % 4 == 0, which the old rule rejected;
+        it is sound because nothing is promoted out of the coarsest level."""
+        from fms.modules.telescoping_attn.range_spec import (
+            RangeSpec, activation_times_from_fmap, range_bounds)
+        a = activation_times_from_fmap({1: 2, 2: 4})
+        self.assertEqual(a, (0, 3, 8))
+        spec = RangeSpec(a, 6, 64)
+        cycle = [tuple(range_bounds(spec, q, l)[1] - range_bounds(spec, q, l)[0]
+                       for l in range(3)) for q in range(10, 14)]
+        self.assertEqual(cycle, [(3, 2, 1), (2, 3, 1), (3, 1, 2), (2, 2, 2)])
+
+    def test_intermediate_levels_stay_strict(self):
+        """A level WITH a parent must interleave with it exactly; phase 0 there
+        collides (a=(0,3,8,...) would promote levels 2 and 3 on the same step)."""
+        from fms.modules.telescoping_attn.range_spec import (
+            activation_times_from_fmap)
+        with self.assertRaises(ValueError):
+            activation_times_from_fmap({1: 2, 2: 4, 3: 6})
+
+    def test_schedule_must_advance_enough_for_children_to_survive(self):
+        from fms.modules.telescoping_attn.range_spec import (
+            activation_times_from_fmap)
+        with self.assertRaises(ValueError):
+            activation_times_from_fmap({1: 2, 2: 2})
+
+    def test_every_accepted_schedule_is_sound(self):
+        """Exhaustive: no accepted schedule may promote two levels on one step,
+        or merge a child that has already been evicted."""
+        from itertools import product
+        from fms.modules.telescoping_attn.range_spec import (
+            RangeSpec, activation_times_from_fmap, range_bounds)
+        checked = 0
+        for L, rng in ((1, range(1, 12)), (2, range(1, 9)), (3, range(1, 7))):
+            for combo in product(rng, repeat=L):
+                try:
+                    a = activation_times_from_fmap(
+                        {i + 1: v for i, v in enumerate(combo)})
+                except ValueError:
+                    continue
+                checked += 1
+                for t in range(1, 600):
+                    fired = [l for l in range(1, L + 1)
+                             if t >= a[l] and (t - a[l]) % (1 << l) == 0]
+                    self.assertLessEqual(len(fired), 1, f"{a} collides at {t}")
+                    if not fired:
+                        continue
+                    l = fired[0]
+                    j = (t - a[l]) >> l
+                    lo, hi = range_bounds(
+                        RangeSpec(a, 4096, t + 1), t - 1, l - 1)
+                    self.assertTrue(lo <= 2 * j and 2 * j + 1 < hi,
+                                    f"{a}: dead child at t={t} level {l}")
+        # guard against the sweep silently checking nothing
+        self.assertGreater(checked, 20)
+
+
 @unittest.skipUnless(_flex_available, "flex_attention requires torch >= 2.5")
 class TelescopingPaddingTests(unittest.TestCase):
     """A padding mask is handled by realigning each row's real tokens to the

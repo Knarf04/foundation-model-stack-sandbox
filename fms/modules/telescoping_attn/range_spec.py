@@ -25,9 +25,27 @@ EMPTY: Tuple[int, int] = (0, 0)
 
 def activation_times_from_fmap(fmap: Dict[int, int]) -> Tuple[int, ...]:
     """
-    a[l] = first query at which node 0 of level l becomes visible, and the
-    dyadic-alignment check a[l] mod 2^l == 2^(l-1). Deliberately duplicates the
-    suite's oracle so this module has no test dependency.
+    a[l] = first query at which node 0 of level l becomes visible, plus the
+    dyadic-alignment check. Deliberately duplicates the suite's oracle so this
+    module has no test dependency.
+
+    What alignment is FOR: level l promotes a node at every t with
+    t == a[l] (mod 2^l), and the tree update assumes at most one level does so
+    at any t. Since 2^l divides 2^L, level L's firing times collide with
+    level l exactly when a[L] == 2^(l-1) (mod 2^l) -- that is, when a[L]'s
+    lowest set bit sits at position l-1.
+
+    A level with a parent must therefore interleave with it exactly:
+    a[l] == 2^(l-1) (mod 2^l), the binary-carry ("ruler") pattern.
+
+    THE COARSEST LEVEL IS DIFFERENT: nothing is ever promoted out of it, so it
+    has no parent to interleave with and only has to dodge the levels below.
+    That holds iff its lowest set bit is at or above L-1, i.e.
+    a[L] % 2^(L-1) == 0 -- which admits a[L] == 0 (mod 2^L) as well as the
+    2^(L-1) phase the stricter rule allowed. Requiring the strict phase there
+    too would reject sound schedules: with L=2 and a=(0, 3, 8) every query
+    sees 2-3 tokens, 1-3 two-token summaries and 1-2 four-token summaries,
+    with no collision and no dangling child, yet a[2] % 4 == 0.
     """
     if not fmap:
         return (0,)
@@ -44,12 +62,36 @@ def activation_times_from_fmap(fmap: Dict[int, int]) -> Tuple[int, ...]:
             + (1 << (level - 1)) * (fmap[level] - fmap[level - 1])
             + (1 << (level - 2))
         )
-    for level in range(1, L + 1):
+    for level in range(1, L):
         if a[level] % (1 << level) != (1 << (level - 1)):
             raise ValueError(
                 f"fmap not dyadically aligned at level {level}: "
                 f"a[{level}]={a[level]} has phase {a[level] % (1 << level)} "
-                f"mod {1 << level}, expected {1 << (level - 1)}."
+                f"mod {1 << level}, expected {1 << (level - 1)} so that "
+                f"level {level} interleaves with its parent, level "
+                f"{level + 1}."
+            )
+    # Coarsest level: no parent, so only the levels below constrain it.
+    if a[L] % (1 << (L - 1)) != 0:
+        raise ValueError(
+            f"fmap not dyadically aligned at the coarsest level {L}: "
+            f"a[{L}]={a[L]} has phase {a[L] % (1 << (L - 1))} mod "
+            f"{1 << (L - 1)}, expected 0 -- its lowest set bit must sit at or "
+            f"above bit {L - 1}, or it promotes on the same step as a finer "
+            f"level."
+        )
+    # Each level must outlive its children long enough for both to still be
+    # there at promotion time. Alignment alone does not imply it: a schedule
+    # that advances too little between levels would have a parent form from a
+    # child that has already been evicted.
+    for level in range(2, L + 1):
+        if a[level] - a[level - 1] < (1 << (level - 1)) + (1 << (level - 2)):
+            raise ValueError(
+                f"fmap advances too little into level {level}: "
+                f"a[{level}]-a[{level - 1}]={a[level] - a[level - 1]} leaves "
+                f"level-{level - 1} nodes evicted before their parent merges "
+                f"them; need at least "
+                f"{(1 << (level - 1)) + (1 << (level - 2))}."
             )
     return tuple(a)
 
