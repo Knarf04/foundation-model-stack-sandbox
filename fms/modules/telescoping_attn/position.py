@@ -5,6 +5,7 @@ rope/bin-distance are an independent oracle, and the mini<->ref comparison
 only has force while the two share nothing but range_spec.
 """
 
+import os
 from typing import Tuple
 
 import torch
@@ -51,6 +52,62 @@ def rope_tables(
     )[:, None] * inv_freq[None, :]
     return torch.cos(angles), torch.sin(angles)
 
+def _rope_body(
+    x: torch.Tensor,
+    positions: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    inverse: bool,
+) -> torch.Tensor:
+    """The rotation itself. THIS expression is the specification: gather the
+    tables, compute in fp32, round to x's dtype exactly once."""
+    D = x.shape[-1]
+    c = cos[positions]  # [..., D/2]
+    s = sin[positions]
+    if inverse:
+        s = -s
+    x_fp32 = x.float()
+    x1, x2 = x_fp32[..., : D // 2], x_fp32[..., D // 2:]
+    rotated = torch.cat([x1 * c - x2 * s, x2 * c + x1 * s], dim=-1)
+    return rotated.to(x.dtype)
+
+
+# Eager, this expression runs at about twelve times its own memory-traffic
+# floor: it materialises `x` in fp32, six intermediates and a `cat`, roughly
+# 700 MB of traffic for a tensor pair worth 67 MB. Measured at N=4096, B=2,
+# Hq=16, D=128 that is 1.79 ms -- more than three times the attention kernel
+# it feeds. Compiled it is 0.164 ms, which IS the floor.
+#
+# A bitwise-preserving eager rewrite was tried and is not worth having:
+# dropping the full upcast and the `cat` gives 1.65 ms, and it is SLOWER at
+# small shapes. Eager cannot fuse this; only the compiler can.
+#
+# The compiled form is NOT bitwise identical -- inductor contracts
+# `x1*c - x2*s` into an FMA where eager rounds the two products separately.
+# The difference is one ulp: 8.8e-8 relative in fp32 (against a suite that
+# compares at 1e-5) and 2.8e-3 in bfloat16 (against a dtype floor an order
+# of magnitude looser). `TELESCOPE_ROPE_EAGER=1` forces the uncompiled
+# expression for anyone who needs the spec's exact bits.
+#
+# `dynamic` is left at torch's default rather than pinned: static is 2.4x
+# faster than dynamic=True at the training shapes, and torch falls back to a
+# dynamic graph by itself once it sees a second shape, which is what the
+# decode path needs. Pinning either way would lose one of the two.
+_ROPE_COMPILED = {"tried": False, "fn": None}
+_ROPE_EAGER_ENV = "TELESCOPE_ROPE_EAGER"
+
+
+def _rope_compiled():
+    """The compiled body, or None if this build cannot produce one."""
+    if not _ROPE_COMPILED["tried"]:
+        _ROPE_COMPILED["tried"] = True
+        try:
+            _ROPE_COMPILED["fn"] = torch.compile(_rope_body)
+        except Exception:  # no triton, unsupported torch, ...
+            _ROPE_COMPILED["fn"] = None
+    return _ROPE_COMPILED["fn"]
+
+
 def apply_rope(
     x: torch.Tensor,
     positions: torch.Tensor,
@@ -62,6 +119,11 @@ def apply_rope(
     x: [..., D]  positions: ints broadcastable to x.shape[:-1]
     cos/sin: [n_pos, D/2]  -> rotated x in x.dtype, computed fp32.
     inverse=True applies R(-p), the VJP of the forward rotation.
+
+    On CUDA this runs `_rope_body` through torch.compile, which is ~11x
+    faster and one ulp different; see the note above that function. CPU
+    stays eager -- it is not where the time goes, and compiling there would
+    pay warm-up on every shape the CPU test suite touches.
     """
     if cos.shape != sin.shape:
         raise ValueError(
@@ -72,14 +134,15 @@ def apply_rope(
         raise ValueError(
             f"rope tables cover dim {2 * cos.shape[-1]}, x has dim {D}"
         )
-    c = cos[positions]  # [..., D/2]
-    s = sin[positions]
-    if inverse:
-        s = -s
-    x_fp32 = x.float()
-    x1, x2 = x_fp32[..., : D // 2], x_fp32[..., D // 2:]
-    rotated = torch.cat([x1 * c - x2 * s, x2 * c + x1 * s], dim=-1)
-    return rotated.to(x.dtype)
+    if x.is_cuda and not os.environ.get(_ROPE_EAGER_ENV):
+        fn = _rope_compiled()
+        if fn is not None:
+            try:
+                return fn(x, positions, cos, sin, inverse)
+            except Exception:
+                # A compile failure must not become a correctness failure.
+                _ROPE_COMPILED["fn"] = None
+    return _rope_body(x, positions, cos, sin, inverse)
 
 def validate_summary_causality(spec: RangeSpec) -> None:
     """
